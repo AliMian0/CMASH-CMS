@@ -104,6 +104,20 @@ def init_db() -> None:
                     FOREIGN KEY(emp_id) REFERENCES employees(id)
                 )''')
 
+    c.execute('''CREATE TABLE IF NOT EXISTS returns (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sale_id INTEGER NOT NULL,
+                    sale_item_id INTEGER NOT NULL,
+                    product_id INTEGER NOT NULL,
+                    qty INTEGER NOT NULL,
+                    refund_amount REAL NOT NULL,
+                    return_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    note TEXT,
+                    FOREIGN KEY(sale_id) REFERENCES sales(id),
+                    FOREIGN KEY(sale_item_id) REFERENCES sale_items(id),
+                    FOREIGN KEY(product_id) REFERENCES products(id)
+                )''')
+
     conn.commit()
     conn.close()
     migrate_db()
@@ -115,6 +129,7 @@ def reset_all_data() -> None:
     conn = get_conn()
     try:
         # Delete child records first because foreign-key enforcement is enabled.
+        conn.execute("DELETE FROM returns")
         conn.execute("DELETE FROM sale_items")
         conn.execute("DELETE FROM sales")
         conn.execute("DELETE FROM employee_payments")
@@ -388,11 +403,25 @@ def login_gate() -> bool:
 # GENERAL HELPERS
 # =====================================================================
 
-def to_excel_bytes(sheets: dict[str, pd.DataFrame]) -> io.BytesIO:
+def to_excel_bytes(
+    sheets: dict[str, pd.DataFrame],
+    start_dt: date | None = None,
+    end_dt: date | None = None,
+) -> io.BytesIO:
+    """Writes each dataframe to its own sheet, with a small header showing the
+    exact date/time the report was generated (and the date range, if given)
+    at the top of every sheet."""
     output = io.BytesIO()
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         for sheet_name, df in sheets.items():
-            df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+            safe_name = sheet_name[:31]
+            meta_rows = [["Generated On:", generated_at]]
+            if start_dt and end_dt:
+                meta_rows.append(["Report Date Range:", f"{start_dt} to {end_dt}"])
+            meta_df = pd.DataFrame(meta_rows)
+            meta_df.to_excel(writer, index=False, header=False, sheet_name=safe_name, startrow=0)
+            df.to_excel(writer, index=False, sheet_name=safe_name, startrow=len(meta_rows) + 1)
     output.seek(0)
     return output
 
@@ -456,30 +485,26 @@ def delete_employee_payment(conn: sqlite3.Connection, payment_id: int) -> None:
 
 def render_receipt(sale: dict) -> None:
     """Renders a printable thermal-receipt widget (58mm or 80mm) with a
-    Print button. Works with any thermal printer set up as a normal
-    Windows/Mac printer - clicking Print opens the browser's print dialog
-    scoped to just this receipt."""
-
+    Print button instantly from session state."""
     settings = get_all_settings()
     paper_mm = settings.get("paper_width_mm", "80") or "80"
 
-    items_rows = ""
-    for it in sale["items"]:
-        items_rows += (
-            f"<tr>"
-            f"<td style='text-align:left'>{it['name']}</td>"
-            f"<td style='text-align:center'>{it['qty']}</td>"
-            f"<td style='text-align:right'>{it['price']:,.2f}</td>"
-            f"<td style='text-align:right'>{it['line_total']:,.2f}</td>"
-            f"</tr>"
-        )
+    items_rows = "".join([
+        f"<tr>"
+        f"<td style='text-align:left'>{it['name']}</td>"
+        f"<td style='text-align:center'>{it['qty']}</td>"
+        f"<td style='text-align:right'>{it['price']:,.2f}</td>"
+        f"<td style='text-align:right'>{it['line_total']:,.2f}</td>"
+        f"</tr>"
+        for it in sale["items"]
+    ])
 
-    emp_line = f"<p>Employee: {sale['emp_label']}</p>" if sale.get("emp_label") else ""
-    address_line = f"<p>{settings['shop_address']}</p>" if settings.get("shop_address") else ""
-    phone_line = f"<p>{settings['shop_phone']}</p>" if settings.get("shop_phone") else ""
+    emp_line = f"<p style='margin:2px 0;'>Employee: {sale['emp_label']}</p>" if sale.get("emp_label") else ""
+    address_line = f"<p style='margin:2px 0;'>{settings['shop_address']}</p>" if settings.get("shop_address") else ""
+    phone_line = f"<p style='margin:2px 0;'>{settings['shop_phone']}</p>" if settings.get("shop_phone") else ""
 
     receipt_body = f"""
-    <div id="receipt-wrapper" style="display:flex; flex-direction:column; align-items:center; font-family:Arial, sans-serif;">
+    <div id="receipt-wrapper" style="display:flex; flex-direction:column; align-items:center; font-family:sans-serif;">
       <div id="receipt" style="width:{paper_mm}mm; min-width:220px; background:#fff; color:#000;
            font-family:'Courier New', monospace; font-size:12px; padding:10px;
            border:1px solid #ddd; box-shadow:0 1px 4px rgba(0,0,0,0.15);">
@@ -514,23 +539,23 @@ def render_receipt(sale: dict) -> None:
           <span>TOTAL</span><span>PKR {sale['total']:,.2f}</span>
         </div>
         <hr style="border:none; border-top:1px dashed #000; margin:6px 0;">
-        <p style="text-align:center; font-size:11px;">{settings['receipt_footer']}</p>
+        <p style="text-align:center; font-size:11px; margin:2px 0;">{settings['receipt_footer']}</p>
       </div>
       <button onclick="window.print()"
-              style="margin-top:12px; padding:8px 20px; font-size:14px; cursor:pointer;
-                     background:#0f9d58; color:#fff; border:none; border-radius:6px;">
+              style="margin-top:10px; padding:8px 20px; font-size:14px; cursor:pointer;
+                     background:#0f9d58; color:#fff; border:none; border-radius:6px; font-weight:bold;">
         🖨️ Print Receipt
       </button>
     </div>
     <style>
       @media print {{
         button {{ display: none !important; }}
-        body {{ margin: 0; }}
+        body {{ margin: 0; padding: 0; }}
       }}
     </style>
     """
 
-    components.html(receipt_body, height=520, scrolling=True)
+    components.html(receipt_body, height=450, scrolling=False)
 
 
 # =====================================================================
@@ -735,6 +760,7 @@ def module_pos(conn: sqlite3.Connection) -> None:
                     emp_row = employees[employees["id"] == selected_emp_id].iloc[0]
                     emp_label = f"{emp_row['emp_code']} - {emp_row['name']}"
 
+                # Store sale details to render receipt immediately without requiring a forced rerun
                 st.session_state["last_sale"] = {
                     "sale_id": sale_id,
                     "sale_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -751,10 +777,10 @@ def module_pos(conn: sqlite3.Connection) -> None:
                         for c in cart
                     ],
                 }
+                # Reset cart state in place
                 st.session_state["pos_cart"] = []
                 st.session_state["pos_selected_product_id"] = None
                 st.success(f"Sale recorded! Total Bill: PKR {cart_total:,.2f}")
-                st.rerun()
 
     with col2:
         if st.session_state.get("last_sale"):
@@ -763,6 +789,177 @@ def module_pos(conn: sqlite3.Connection) -> None:
             if st.button("Dismiss Receipt"):
                 st.session_state["last_sale"] = None
                 st.rerun()
+
+
+# =====================================================================
+# MODULE: RETURNS
+# =====================================================================
+
+def add_return(
+    conn: sqlite3.Connection,
+    sale_id: int,
+    sale_item_id: int,
+    product_id: int,
+    qty: int,
+    refund_amount: float,
+    note: str,
+) -> None:
+    conn.execute(
+        """INSERT INTO returns (sale_id, sale_item_id, product_id, qty, refund_amount, note)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (sale_id, sale_item_id, product_id, qty, refund_amount, note.strip()),
+    )
+    conn.execute("UPDATE products SET stock_qty = stock_qty + ? WHERE id = ?", (qty, product_id))
+    conn.commit()
+
+
+def module_returns(conn: sqlite3.Connection) -> None:
+    st.header("↩️ Returns")
+    st.info(
+        "Find the original sale, choose which items/quantities are being returned, "
+        "and process it. This adds the quantity back to stock and adjusts the relevant "
+        "ledger/report totals — the original paid bill itself is never edited or deleted."
+    )
+
+    search_mode = st.radio("Find Sale By", ["Sale ID", "Recent Sales List"], horizontal=True)
+
+    if search_mode == "Sale ID":
+        sid_input = st.number_input("Sale ID", min_value=1, step=1, key="return_sale_id_input")
+        if st.button("🔍 Find Sale"):
+            st.session_state["return_sale_id"] = int(sid_input)
+    else:
+        recent_sales = pd.read_sql(
+            "SELECT id, sale_date, payment_type, total_amount FROM sales ORDER BY sale_date DESC LIMIT 50",
+            conn,
+        )
+        if recent_sales.empty:
+            st.info("No sales recorded yet.")
+            return
+        options = {
+            f"#{int(r['id'])} | {r['sale_date']} | {r['payment_type']} | PKR {r['total_amount']:,.2f}": int(r["id"])
+            for _, r in recent_sales.iterrows()
+        }
+        sel = st.selectbox("Select a recent sale", list(options.keys()), key="return_recent_select")
+        # Automatically persist the selected sale ID to session state
+        st.session_state["return_sale_id"] = options[sel]
+
+    sale_id = st.session_state.get("return_sale_id")
+    if not sale_id:
+        st.info("Please enter or select a Sale ID above to begin.")
+        return  # Replaced st.stop() with return to prevent session state resets
+
+    sale_row_df = pd.read_sql("SELECT * FROM sales WHERE id = ?", conn, params=(sale_id,))
+    if sale_row_df.empty:
+        st.error(f"No sale found with ID {sale_id}.")
+        return
+    sale_row = sale_row_df.iloc[0]
+
+    emp_label = None
+    if sale_row["emp_id"] is not None and not pd.isna(sale_row["emp_id"]):
+        emp_df = pd.read_sql(
+            "SELECT emp_code, name FROM employees WHERE id = ?", conn, params=(int(sale_row["emp_id"]),)
+        )
+        if not emp_df.empty:
+            emp_label = f"{emp_df.iloc[0]['emp_code']} - {emp_df.iloc[0]['name']}"
+
+    st.divider()
+    st.subheader(f"Sale #{sale_id}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Date", sale_row["sale_date"])
+    c2.metric("Payment Type", sale_row["payment_type"])
+    c3.metric("Original Total", f"PKR {sale_row['total_amount']:,.2f}")
+    if emp_label:
+        st.caption(f"Employee: {emp_label}")
+
+    items_df = pd.read_sql(
+        """SELECT si.id AS sale_item_id, si.product_id, p.name, si.qty, si.retail_price,
+                  COALESCE((SELECT SUM(qty) FROM returns WHERE sale_item_id = si.id), 0) AS already_returned
+           FROM sale_items si
+           JOIN products p ON si.product_id = p.id
+           WHERE si.sale_id = ?""",
+        conn,
+        params=(sale_id,),
+    )
+
+    if items_df.empty:
+        st.warning("No items found for this sale.")
+        return
+
+    st.write("### Select quantities to return")
+    return_selections = {}
+    any_returnable = False
+
+    for _, row in items_df.iterrows():
+        remaining = int(row["qty"] - row["already_returned"])
+        if remaining <= 0:
+            st.write(f"✅ **{row['name']}** — fully returned already.")
+            continue
+        any_returnable = True
+        rc1, rc2 = st.columns([3, 1])
+        with rc1:
+            st.write(
+                f"**{row['name']}** — bought {int(row['qty'])}, already returned "
+                f"{int(row['already_returned'])}, returnable {remaining}, "
+                f"unit price PKR {row['retail_price']:,.2f}"
+            )
+        with rc2:
+            qty = st.number_input(
+                "Return Qty",
+                min_value=0,
+                max_value=remaining,
+                value=0,
+                key=f"return_qty_{row['sale_item_id']}",
+                label_visibility="collapsed",
+            )
+        if qty > 0:
+            # Store extracted primitives directly in dictionary to prevent Pandas Series errors
+            return_selections[int(row["sale_item_id"])] = {
+                "qty": int(qty),
+                "product_id": int(row["product_id"]),
+                "price": float(row["retail_price"]),
+            }
+
+    if not any_returnable:
+        st.info("Every item on this sale has already been fully returned.")
+        return
+
+    return_note = st.text_input("Reason / Note (optional)", key="return_note")
+
+    if return_selections:
+        total_refund = sum(item["qty"] * item["price"] for item in return_selections.values())
+        st.metric("Total Refund / Credit Amount", f"PKR {total_refund:,.2f}")
+
+        if st.button("✅ Process Return", type="primary"):
+            for sale_item_id, item_data in return_selections.items():
+                refund_amt = item_data["qty"] * item_data["price"]
+                add_return(
+                    conn,
+                    sale_id=int(sale_id),
+                    sale_item_id=sale_item_id,
+                    product_id=item_data["product_id"],
+                    qty=item_data["qty"],
+                    refund_amount=refund_amt,
+                    note=return_note,
+                )
+            st.success(f"Return processed. PKR {total_refund:,.2f} refunded/credited and stock restored.")
+            st.rerun()
+
+    st.divider()
+    st.subheader("🧾 Return History for This Sale")
+    history_df = pd.read_sql(
+        """SELECT r.return_date AS 'Date', p.name AS 'Item', r.qty AS 'Qty',
+                  r.refund_amount AS 'Refund (PKR)', r.note AS 'Note'
+           FROM returns r
+           JOIN products p ON r.product_id = p.id
+           WHERE r.sale_id = ?
+           ORDER BY r.return_date DESC""",
+        conn,
+        params=(sale_id,),
+    )
+    if history_df.empty:
+        st.caption("No returns recorded yet for this sale.")
+    else:
+        st.dataframe(history_df, use_container_width=True)
 
 
 # =====================================================================
@@ -935,7 +1132,9 @@ def module_inventory(conn: sqlite3.Connection) -> None:
             m3.metric("Profit", f"PKR {movement_df['Profit (PKR)'].sum():,.2f}")
 
         excel_inv = to_excel_bytes(
-            {"Current Inventory": current_inv_df, "Item Movement Report": movement_df}
+            {"Current Inventory": current_inv_df, "Item Movement Report": movement_df},
+            start_dt,
+            end_dt,
         )
         st.download_button(
             "📥 Download Inventory Report (.xlsx)",
@@ -1221,7 +1420,9 @@ def _render_employee_ledger_content(
             detailed_all_df = detailed_all_df.sort_values("Date", ascending=False)
 
         excel_out = to_excel_bytes(
-            {"Balance Summary": display_df, "Detailed Debit-Credit Log": detailed_all_df}
+            {"Balance Summary": display_df, "Detailed Debit-Credit Log": detailed_all_df},
+            start_dt,
+            end_dt,
         )
         st.download_button(
             "📥 Download Employee Ledger Report (.xlsx)",
@@ -1339,7 +1540,7 @@ def _render_payment_type_ledger(conn: sqlite3.Connection, payment_type: str, key
         st.write("### Summary Totals")
         st.dataframe(summary_df, use_container_width=True)
 
-        excel_out = to_excel_bytes({"Summary": summary_df, "Detailed Log": detailed_df})
+        excel_out = to_excel_bytes({"Summary": summary_df, "Detailed Log": detailed_df}, start_dt, end_dt)
         st.download_button(
             f"📥 Download {payment_type} Report (.xlsx)",
             data=excel_out,
@@ -1411,7 +1612,7 @@ def module_reports(conn: sqlite3.Connection) -> None:
     c2.metric("Cost of Goods Sold", f"PKR {tot_cost:,.2f}")
     c3.metric("Net Profit", f"PKR {tot_profit:,.2f}")
 
-    excel_report = to_excel_bytes({"Sales & Profit Report": report_df})
+    excel_report = to_excel_bytes({"Sales & Profit Report": report_df}, start_dt, end_dt)
     st.download_button(
         "📥 Download Report (.xlsx)",
         data=excel_report,
@@ -1464,7 +1665,7 @@ def module_full_reports(conn: sqlite3.Connection) -> None:
             c2.metric("Cost of Goods Sold", f"PKR {report_df['Total Cost (PKR)'].sum():,.2f}")
             c3.metric("Net Profit", f"PKR {report_df['Profit (PKR)'].sum():,.2f}")
 
-            excel_out = to_excel_bytes({"Sales & Profit Report": report_df})
+            excel_out = to_excel_bytes({"Sales & Profit Report": report_df}, start_dt, end_dt)
             st.download_button(
                 "📥 Download Sales Report (.xlsx)",
                 data=excel_out,
@@ -1545,7 +1746,7 @@ def _render_expense_summary_only(
         params=(payment_type, start_str, end_str),
     )
 
-    excel_out = to_excel_bytes({"Summary": summary_df, "Detailed Log": detailed_df})
+    excel_out = to_excel_bytes({"Summary": summary_df, "Detailed Log": detailed_df}, start_dt, end_dt)
     st.download_button(
         f"📥 Download {payment_type} Report (.xlsx)",
         data=excel_out,
@@ -1755,15 +1956,7 @@ def main() -> None:
         if menu == "Point of Sale (POS)":
             module_pos(conn)
         elif menu == "Returns":
-            st.header("↩️ Returns")
-            st.info(
-                "Returns must be recorded against the original paid bill. "
-                "The original paid bill is never edited."
-            )
-            st.warning(
-                "Return processing is reserved for the Returns module. "
-                "Your existing sales database is preserved."
-            )
+            module_returns(conn)
         elif menu == "Inventory Management":
             module_inventory(conn)
         elif menu == "Product Management":
