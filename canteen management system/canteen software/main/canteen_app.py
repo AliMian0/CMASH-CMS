@@ -14,16 +14,7 @@ Run with:  streamlit run canteen_app.py
 """
 import hashlib
 import io
-import json  # <--- ADD THIS IMPORT
-import secrets
-import sqlite3
-from datetime import date, datetime, timedelta
-
-import pandas as pd
-import streamlit as st
-import streamlit.components.v1 as components
-import hashlib
-import io
+import json
 import secrets
 import sqlite3
 from datetime import date, datetime, timedelta
@@ -104,6 +95,15 @@ def init_db() -> None:
                     value TEXT
                 )''')
 
+    c.execute('''CREATE TABLE IF NOT EXISTS employee_payments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    emp_id INTEGER NOT NULL,
+                    amount REAL NOT NULL,
+                    payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    note TEXT,
+                    FOREIGN KEY(emp_id) REFERENCES employees(id)
+                )''')
+
     conn.commit()
     conn.close()
     migrate_db()
@@ -117,6 +117,7 @@ def reset_all_data() -> None:
         # Delete child records first because foreign-key enforcement is enabled.
         conn.execute("DELETE FROM sale_items")
         conn.execute("DELETE FROM sales")
+        conn.execute("DELETE FROM employee_payments")
         conn.execute("DELETE FROM products")
         conn.execute("DELETE FROM employees")
         conn.execute("DELETE FROM users")
@@ -209,6 +210,7 @@ ACCESS_OPTIONS = {
     "hospital": "Hospital Expense",
     "ot": "OT Expense",
     "reports": "Profit & Sales Reports",
+    "reports_center": "Reports Center (All Reports)",
     "excel": "Excel Reports (View / Download)",
 }
 
@@ -432,6 +434,23 @@ def sql_bounds(start: date, end: date) -> tuple[str, str]:
 
 
 # =====================================================================
+# EMPLOYEE PAYMENTS (CREDITS AGAINST THE MONTHLY TAB)
+# =====================================================================
+
+def add_employee_payment(conn: sqlite3.Connection, emp_id: int, amount: float, payment_date: date, note: str) -> None:
+    conn.execute(
+        "INSERT INTO employee_payments (emp_id, amount, payment_date, note) VALUES (?, ?, ?, ?)",
+        (emp_id, amount, f"{payment_date} 00:00:00", note.strip()),
+    )
+    conn.commit()
+
+
+def delete_employee_payment(conn: sqlite3.Connection, payment_id: int) -> None:
+    conn.execute("DELETE FROM employee_payments WHERE id = ?", (payment_id,))
+    conn.commit()
+
+
+# =====================================================================
 # THERMAL RECEIPT PRINTING
 # =====================================================================
 
@@ -531,7 +550,13 @@ def module_pos(conn: sqlite3.Connection) -> None:
 
     if "pos_selected_product_id" not in st.session_state:
         st.session_state["pos_selected_product_id"] = None
+    if "pos_cart" not in st.session_state:
+        st.session_state["pos_cart"] = []  # list of dicts: product_id, name, qty, price, cost_price
 
+    cart = st.session_state["pos_cart"]
+    cart_qty_by_product = {c["product_id"]: c["qty"] for c in cart}
+
+    st.subheader("➕ Add Items to Bill")
     find_mode = st.radio(
         "Find Product By", ["Scan / Enter Barcode", "Select From List"], horizontal=True
     )
@@ -562,20 +587,88 @@ def module_pos(conn: sqlite3.Connection) -> None:
         item_row = products[products["name"] == selected_item].iloc[0]
         st.session_state["pos_selected_product_id"] = int(item_row["id"])
 
-    if item_row is None:
-        st.info("Scan a barcode or select a product to begin.")
+    if item_row is not None:
+        already_in_cart = cart_qty_by_product.get(int(item_row["id"]), 0)
+        remaining_stock = int(item_row["stock_qty"]) - already_in_cart
+
+        if remaining_stock <= 0:
+            st.warning(
+                f"All {int(item_row['stock_qty'])} units of '{item_row['name']}' are already in the cart."
+            )
+        else:
+            ac1, ac2 = st.columns([2, 1])
+            with ac1:
+                st.info(
+                    f"**{item_row['name']}**  |  Available: {remaining_stock}  |  "
+                    f"Retail Price: PKR {item_row['retail_price']:,.2f}"
+                )
+                add_qty = st.number_input(
+                    "Quantity to Add", min_value=1, max_value=remaining_stock, value=1, key="pos_add_qty"
+                )
+            with ac2:
+                st.write("")
+                st.write("")
+                if st.button("➕ Add to Cart", type="primary", use_container_width=True):
+                    for c in cart:
+                        if c["product_id"] == int(item_row["id"]):
+                            c["qty"] += int(add_qty)
+                            break
+                    else:
+                        cart.append(
+                            {
+                                "product_id": int(item_row["id"]),
+                                "name": item_row["name"],
+                                "qty": int(add_qty),
+                                "price": float(item_row["retail_price"]),
+                                "cost_price": float(item_row["cost_price"]),
+                            }
+                        )
+                    st.session_state["pos_cart"] = cart
+                    st.session_state["pos_selected_product_id"] = None
+                    st.rerun()
+
+    st.divider()
+    st.subheader(f"🧺 Current Bill ({len(cart)} item{'s' if len(cart) != 1 else ''})")
+
+    if not cart:
+        st.info("Cart is empty. Find a product above and click 'Add to Cart' to start a bill.")
         return
+
+    cart_total = 0.0
+    for idx, c in enumerate(cart):
+        # Re-check current stock in case it changed since the item was added.
+        live_stock_row = products[products["id"] == c["product_id"]]
+        live_stock = int(live_stock_row.iloc[0]["stock_qty"]) if not live_stock_row.empty else c["qty"]
+
+        row_c1, row_c2, row_c3, row_c4 = st.columns([3, 2, 2, 1])
+        with row_c1:
+            st.write(f"**{c['name']}**")
+        with row_c2:
+            new_qty = st.number_input(
+                "Qty",
+                min_value=1,
+                max_value=max(live_stock, c["qty"]),
+                value=c["qty"],
+                key=f"cart_qty_{c['product_id']}",
+                label_visibility="collapsed",
+            )
+            if new_qty != c["qty"]:
+                cart[idx]["qty"] = int(new_qty)
+                st.session_state["pos_cart"] = cart
+                st.rerun()
+        with row_c3:
+            line_total = c["qty"] * c["price"]
+            cart_total += line_total
+            st.write(f"PKR {c['price']:,.2f} × {c['qty']} = **PKR {line_total:,.2f}**")
+        with row_c4:
+            if st.button("🗑️", key=f"remove_cart_{c['product_id']}"):
+                st.session_state["pos_cart"] = [x for x in cart if x["product_id"] != c["product_id"]]
+                st.rerun()
+
+    st.markdown(f"### 🧾 Bill Total: PKR {cart_total:,.2f}")
 
     col1, col2 = st.columns([2, 1])
     with col1:
-        st.info(
-            f"**{item_row['name']}**  |  Available Stock: {int(item_row['stock_qty'])}  |  "
-            f"Retail Price: PKR {item_row['retail_price']:,.2f}"
-        )
-        qty = st.number_input(
-            "Quantity", min_value=1, max_value=int(item_row["stock_qty"]), value=1, key="pos_qty"
-        )
-
         pay_type = st.radio(
             "Payment Type",
             [
@@ -598,51 +691,70 @@ def module_pos(conn: sqlite3.Connection) -> None:
                     employees[employees["emp_code"] == selected_emp_str.split(" - ")[0]]["id"].values[0]
                 )
 
-        total = qty * item_row["retail_price"]
-        st.metric("Bill Total", f"PKR {total:,.2f}")
-
         can_checkout = not (pay_type in EMPLOYEE_LINKED_PAYMENT_TYPES and employees.empty)
-        if st.button("✅ Complete Transaction", disabled=not can_checkout, type="primary"):
-            c = conn.cursor()
-            c.execute(
-                "INSERT INTO sales (payment_type, emp_id, total_amount) VALUES (?, ?, ?)",
-                (pay_type, selected_emp_id, total),
-            )
-            sale_id = c.lastrowid
-            c.execute(
-                """INSERT INTO sale_items (sale_id, product_id, qty, cost_price, retail_price)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (sale_id, int(item_row["id"]), int(qty), item_row["cost_price"], item_row["retail_price"]),
-            )
-            c.execute(
-                "UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?",
-                (int(qty), int(item_row["id"])),
-            )
-            conn.commit()
+        checkout_clicked = st.button(
+            "✅ Complete Transaction", disabled=not can_checkout, type="primary"
+        )
 
-            emp_label = None
-            if selected_emp_id is not None:
-                emp_row = employees[employees["id"] == selected_emp_id].iloc[0]
-                emp_label = f"{emp_row['emp_code']} - {emp_row['name']}"
-
-            st.session_state["last_sale"] = {
-                "sale_id": sale_id,
-                "sale_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "payment_type": pay_type,
-                "emp_label": emp_label,
-                "total": total,
-                "items": [
-                    {
-                        "name": item_row["name"],
-                        "qty": int(qty),
-                        "price": float(item_row["retail_price"]),
-                        "line_total": float(total),
-                    }
-                ],
-            }
-            st.session_state["pos_selected_product_id"] = None
-            st.success(f"Sale recorded! Total Bill: PKR {total:,.2f}")
+        if st.button("🧹 Clear Cart"):
+            st.session_state["pos_cart"] = []
             st.rerun()
+
+        if checkout_clicked:
+            # Re-validate stock for every cart line right before committing.
+            insufficient = []
+            for c in cart:
+                live_row = products[products["id"] == c["product_id"]]
+                live_stock = int(live_row.iloc[0]["stock_qty"]) if not live_row.empty else 0
+                if c["qty"] > live_stock:
+                    insufficient.append(f"{c['name']} (have {live_stock}, need {c['qty']})")
+
+            if insufficient:
+                st.error("Not enough stock for: " + "; ".join(insufficient) + ". Please adjust the cart.")
+            else:
+                cc = conn.cursor()
+                cc.execute(
+                    "INSERT INTO sales (payment_type, emp_id, total_amount) VALUES (?, ?, ?)",
+                    (pay_type, selected_emp_id, cart_total),
+                )
+                sale_id = cc.lastrowid
+                for c in cart:
+                    cc.execute(
+                        """INSERT INTO sale_items (sale_id, product_id, qty, cost_price, retail_price)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        (sale_id, c["product_id"], c["qty"], c["cost_price"], c["price"]),
+                    )
+                    cc.execute(
+                        "UPDATE products SET stock_qty = stock_qty - ? WHERE id = ?",
+                        (c["qty"], c["product_id"]),
+                    )
+                conn.commit()
+
+                emp_label = None
+                if selected_emp_id is not None:
+                    emp_row = employees[employees["id"] == selected_emp_id].iloc[0]
+                    emp_label = f"{emp_row['emp_code']} - {emp_row['name']}"
+
+                st.session_state["last_sale"] = {
+                    "sale_id": sale_id,
+                    "sale_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "payment_type": pay_type,
+                    "emp_label": emp_label,
+                    "total": cart_total,
+                    "items": [
+                        {
+                            "name": c["name"],
+                            "qty": c["qty"],
+                            "price": c["price"],
+                            "line_total": c["qty"] * c["price"],
+                        }
+                        for c in cart
+                    ],
+                }
+                st.session_state["pos_cart"] = []
+                st.session_state["pos_selected_product_id"] = None
+                st.success(f"Sale recorded! Total Bill: PKR {cart_total:,.2f}")
+                st.rerun()
 
     with col2:
         if st.session_state.get("last_sale"):
@@ -839,7 +951,10 @@ def module_inventory(conn: sqlite3.Connection) -> None:
 
 def module_employee_ledger(conn: sqlite3.Connection) -> None:
     st.header("👥 Employee Ledger & Consumption Recovery")
-    st.caption("Tracks canteen items bought on the monthly employee tab (Employee Tab payment type).")
+    st.caption(
+        "Tracks canteen items bought on the monthly employee tab (debit) and "
+        "payments received from employees against that tab (credit)."
+    )
 
     col1, col2 = st.columns([1, 2])
     with col1:
@@ -883,10 +998,237 @@ def module_employee_ledger(conn: sqlite3.Connection) -> None:
             st.info("No employees registered yet.")
 
     with col2:
-        _render_payment_type_ledger(
+        st.subheader("Ledger Date Range")
+        start_dt, end_dt = date_range_picker("emp_ledger")
+        _render_employee_ledger_content(conn, start_dt, end_dt, key_prefix="emp_ledger", show_actions=True)
+
+
+# =====================================================================
+# EMPLOYEE LEDGER: DEBIT (PURCHASES) / CREDIT (PAYMENTS) DATA HELPERS
+# =====================================================================
+
+def _get_employee_debit_credit_summary(conn: sqlite3.Connection, start_str: str, end_str: str) -> pd.DataFrame:
+    employees_df = pd.read_sql("SELECT id, emp_code, name, dept FROM employees ORDER BY name", conn)
+
+    debit_df = pd.read_sql(
+        """SELECT s.emp_id AS id, SUM(si.qty * si.retail_price) AS debit_total
+           FROM sales s
+           JOIN sale_items si ON s.id = si.sale_id
+           WHERE s.payment_type = 'Employee Tab (Monthly Account)'
+             AND s.sale_date BETWEEN ? AND ?
+           GROUP BY s.emp_id""",
+        conn,
+        params=(start_str, end_str),
+    )
+    credit_df = pd.read_sql(
+        """SELECT emp_id AS id, SUM(amount) AS credit_total
+           FROM employee_payments
+           WHERE payment_date BETWEEN ? AND ?
+           GROUP BY emp_id""",
+        conn,
+        params=(start_str, end_str),
+    )
+
+    summary_df = employees_df.merge(debit_df, on="id", how="left").merge(credit_df, on="id", how="left")
+    summary_df["debit_total"] = summary_df["debit_total"].fillna(0)
+    summary_df["credit_total"] = summary_df["credit_total"].fillna(0)
+    summary_df["balance"] = summary_df["debit_total"] - summary_df["credit_total"]
+    return summary_df
+
+
+def _get_employee_debit_credit_detail(conn: sqlite3.Connection, emp_id: int, start_str: str, end_str: str) -> pd.DataFrame:
+    debit_rows = pd.read_sql(
+        """SELECT s.sale_date AS date_sort, s.sale_date AS 'Date',
+                  'Debit (Purchase)' AS 'Type', p.name AS 'Description',
+                  (si.qty * si.retail_price) AS 'Amount (PKR)'
+           FROM sales s
+           JOIN sale_items si ON s.id = si.sale_id
+           JOIN products p ON si.product_id = p.id
+           WHERE s.emp_id = ? AND s.payment_type = 'Employee Tab (Monthly Account)'
+             AND s.sale_date BETWEEN ? AND ?""",
+        conn,
+        params=(emp_id, start_str, end_str),
+    )
+    credit_rows = pd.read_sql(
+        """SELECT payment_date AS date_sort, payment_date AS 'Date',
+                  'Credit (Payment)' AS 'Type',
+                  COALESCE(NULLIF(note, ''), 'Payment received') AS 'Description',
+                  amount AS 'Amount (PKR)'
+           FROM employee_payments
+           WHERE emp_id = ? AND payment_date BETWEEN ? AND ?""",
+        conn,
+        params=(emp_id, start_str, end_str),
+    )
+    combined = pd.concat([debit_rows, credit_rows], ignore_index=True)
+    if not combined.empty:
+        combined = combined.sort_values("date_sort", ascending=False).drop(columns=["date_sort"])
+    else:
+        combined = combined.drop(columns=["date_sort"], errors="ignore")
+    return combined
+
+
+def _render_employee_ledger_content(
+    conn: sqlite3.Connection,
+    start_dt: date,
+    end_dt: date,
+    key_prefix: str = "emp_ledger",
+    show_actions: bool = True,
+) -> None:
+    start_str, end_str = sql_bounds(start_dt, end_dt)
+
+    employees = pd.read_sql("SELECT * FROM employees ORDER BY name", conn)
+    if employees.empty:
+        st.info("No employees registered yet.")
+        return
+
+    if show_actions:
+        st.divider()
+        st.subheader("💳 Record Payment / Credit")
+        st.caption("Use this when an employee pays off some or all of their outstanding tab.")
+        with st.form("record_payment_form", clear_on_submit=True):
+            pay_emp_str = st.selectbox(
+                "Employee",
+                [f"{r['emp_code']} - {r['name']}" for _, r in employees.iterrows()],
+                key=f"{key_prefix}_payment_emp",
+            )
+            pay_amount = st.number_input(
+                "Amount Received (PKR)", min_value=0.0, step=1.0, key=f"{key_prefix}_payment_amount"
+            )
+            pay_date = st.date_input("Payment Date", value=date.today(), key=f"{key_prefix}_payment_date")
+            pay_note = st.text_input("Note (optional)", key=f"{key_prefix}_payment_note")
+            pay_submitted = st.form_submit_button("💾 Record Payment")
+        if pay_submitted:
+            if pay_amount <= 0:
+                st.error("Amount must be greater than 0.")
+            else:
+                pay_emp_id = int(
+                    employees[employees["emp_code"] == pay_emp_str.split(" - ")[0]]["id"].values[0]
+                )
+                add_employee_payment(conn, pay_emp_id, pay_amount, pay_date, pay_note)
+                st.success(f"Recorded PKR {pay_amount:,.2f} payment for {pay_emp_str}.")
+                st.rerun()
+
+        st.divider()
+
+    emp_sel = st.selectbox(
+        "View Individual Ledger For:",
+        [f"{r['emp_code']} - {r['name']}" for _, r in employees.iterrows()],
+        key=f"{key_prefix}_view_emp_select",
+    )
+    emp_id = int(employees[employees["emp_code"] == emp_sel.split(" - ")[0]]["id"].values[0])
+
+    combined_df = _get_employee_debit_credit_detail(conn, emp_id, start_str, end_str)
+    st.dataframe(combined_df, use_container_width=True)
+
+    debit_total = (
+        combined_df.loc[combined_df["Type"] == "Debit (Purchase)", "Amount (PKR)"].sum()
+        if not combined_df.empty
+        else 0
+    )
+    credit_total = (
+        combined_df.loc[combined_df["Type"] == "Credit (Payment)", "Amount (PKR)"].sum()
+        if not combined_df.empty
+        else 0
+    )
+    balance = debit_total - credit_total
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Total Purchases (Debit)", f"PKR {debit_total:,.2f}")
+    m2.metric("Total Paid (Credit)", f"PKR {credit_total:,.2f}")
+    m3.metric("Outstanding Balance", f"PKR {balance:,.2f}")
+
+    if show_actions:
+        raw_payments = pd.read_sql(
+            """SELECT id, payment_date, amount, note FROM employee_payments
+               WHERE emp_id = ? AND payment_date BETWEEN ? AND ?
+               ORDER BY payment_date DESC""",
             conn,
-            payment_type="Employee Tab (Monthly Account)",
-            key_prefix="emp_ledger",
+            params=(emp_id, start_str, end_str),
+        )
+        if not raw_payments.empty:
+            st.caption("Remove a wrongly entered payment:")
+            options = {
+                f"{r['payment_date']} | PKR {r['amount']:,.2f}" + (f" | {r['note']}" if r["note"] else ""): int(
+                    r["id"]
+                )
+                for _, r in raw_payments.iterrows()
+            }
+            del_label = st.selectbox(
+                "Select payment to delete", list(options.keys()), key=f"{key_prefix}_del_payment"
+            )
+            if st.button("🗑️ Delete Payment Entry", key=f"{key_prefix}_del_payment_btn"):
+                delete_employee_payment(conn, options[del_label])
+                st.warning("Payment entry deleted.")
+                st.rerun()
+
+    st.divider()
+    st.header("📑 Balance Summary Export (All Employees)")
+    st.caption(f"Using the date range: {start_dt} to {end_dt}")
+
+    summary_df = _get_employee_debit_credit_summary(conn, start_str, end_str)
+    display_df = summary_df[(summary_df["debit_total"] > 0) | (summary_df["credit_total"] > 0)].copy()
+
+    if display_df.empty:
+        st.info("No employee tab activity (purchases or payments) in this date range.")
+    else:
+        display_df = display_df.rename(
+            columns={
+                "emp_code": "Employee ID",
+                "name": "Employee Name",
+                "dept": "Department",
+                "debit_total": "Total Purchases (PKR)",
+                "credit_total": "Total Paid (PKR)",
+                "balance": "Outstanding Balance (PKR)",
+            }
+        )[
+            [
+                "Employee ID",
+                "Employee Name",
+                "Department",
+                "Total Purchases (PKR)",
+                "Total Paid (PKR)",
+                "Outstanding Balance (PKR)",
+            ]
+        ]
+        st.dataframe(display_df, use_container_width=True)
+
+        detailed_debits = pd.read_sql(
+            """SELECT s.sale_date AS 'Date', e.emp_code AS 'Employee ID', e.name AS 'Employee Name',
+                      'Debit (Purchase)' AS 'Type', p.name AS 'Description',
+                      (si.qty * si.retail_price) AS 'Amount (PKR)'
+               FROM sales s
+               JOIN sale_items si ON s.id = si.sale_id
+               JOIN products p ON si.product_id = p.id
+               JOIN employees e ON s.emp_id = e.id
+               WHERE s.payment_type = 'Employee Tab (Monthly Account)'
+                 AND s.sale_date BETWEEN ? AND ?""",
+            conn,
+            params=(start_str, end_str),
+        )
+        detailed_credits = pd.read_sql(
+            """SELECT ep.payment_date AS 'Date', e.emp_code AS 'Employee ID', e.name AS 'Employee Name',
+                      'Credit (Payment)' AS 'Type',
+                      COALESCE(NULLIF(ep.note, ''), 'Payment received') AS 'Description',
+                      ep.amount AS 'Amount (PKR)'
+               FROM employee_payments ep
+               JOIN employees e ON ep.emp_id = e.id
+               WHERE ep.payment_date BETWEEN ? AND ?""",
+            conn,
+            params=(start_str, end_str),
+        )
+        detailed_all_df = pd.concat([detailed_debits, detailed_credits], ignore_index=True)
+        if not detailed_all_df.empty:
+            detailed_all_df = detailed_all_df.sort_values("Date", ascending=False)
+
+        excel_out = to_excel_bytes(
+            {"Balance Summary": display_df, "Detailed Debit-Credit Log": detailed_all_df}
+        )
+        st.download_button(
+            "📥 Download Employee Ledger Report (.xlsx)",
+            data=excel_out,
+            file_name=f"Employee_Ledger_{start_dt}_to_{end_dt}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"{key_prefix}_download",
         )
 
 
@@ -1079,6 +1421,141 @@ def module_reports(conn: sqlite3.Connection) -> None:
 
 
 # =====================================================================
+# MODULE: REPORTS CENTER (all range-based reports in one place)
+# =====================================================================
+
+def module_full_reports(conn: sqlite3.Connection) -> None:
+    st.header("📈 Reports Center")
+    st.caption(
+        "One place to pull range-based reports: overall Sales, Employee Ledger "
+        "(debit/credit), Hospital Expense, and OT Expense — all for the same date range."
+    )
+
+    start_dt, end_dt = date_range_picker("reports_center")
+    start_str, end_str = sql_bounds(start_dt, end_dt)
+
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["💰 Sales Report", "👥 Employee Ledger", "🏥 Hospital Expense", "🕒 OT Expense"]
+    )
+
+    # ---------------- Sales Report ----------------
+    with tab1:
+        report_df = pd.read_sql(
+            """SELECT p.name AS 'Product Name',
+                      SUM(si.qty) AS 'Units Sold',
+                      SUM(si.qty * si.cost_price) AS 'Total Cost (PKR)',
+                      SUM(si.qty * si.retail_price) AS 'Total Revenue (PKR)',
+                      SUM(si.qty * (si.retail_price - si.cost_price)) AS 'Profit (PKR)'
+               FROM sale_items si
+               JOIN sales s ON si.sale_id = s.id
+               JOIN products p ON si.product_id = p.id
+               WHERE s.sale_date BETWEEN ? AND ?
+               GROUP BY p.id
+               ORDER BY p.name""",
+            conn,
+            params=(start_str, end_str),
+        )
+        if report_df.empty:
+            st.info("No sales records found for this period.")
+        else:
+            st.dataframe(report_df, use_container_width=True)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Gross Sales", f"PKR {report_df['Total Revenue (PKR)'].sum():,.2f}")
+            c2.metric("Cost of Goods Sold", f"PKR {report_df['Total Cost (PKR)'].sum():,.2f}")
+            c3.metric("Net Profit", f"PKR {report_df['Profit (PKR)'].sum():,.2f}")
+
+            excel_out = to_excel_bytes({"Sales & Profit Report": report_df})
+            st.download_button(
+                "📥 Download Sales Report (.xlsx)",
+                data=excel_out,
+                file_name=f"Sales_Report_{start_dt}_to_{end_dt}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="reports_center_sales_download",
+            )
+
+    # ---------------- Employee Ledger (debit/credit) ----------------
+    with tab2:
+        employees = pd.read_sql("SELECT * FROM employees ORDER BY name", conn)
+        if employees.empty:
+            st.info("No employees registered yet.")
+        else:
+            _render_employee_ledger_content(
+                conn, start_dt, end_dt, key_prefix="reports_center_emp", show_actions=False
+            )
+
+    # ---------------- Hospital Expense ----------------
+    with tab3:
+        _render_expense_summary_only(
+            conn, payment_type="Hospital Expense", start_dt=start_dt, end_dt=end_dt, key_prefix="reports_center_hospital"
+        )
+
+    # ---------------- OT Expense ----------------
+    with tab4:
+        _render_expense_summary_only(
+            conn, payment_type="OT Expense", start_dt=start_dt, end_dt=end_dt, key_prefix="reports_center_ot"
+        )
+
+
+def _render_expense_summary_only(
+    conn: sqlite3.Connection, payment_type: str, start_dt: date, end_dt: date, key_prefix: str
+) -> None:
+    """Read-only summary + export for Hospital/OT expenses, for use inside Reports Center
+    (no employee-registration UI, since that's not the point of this page)."""
+    start_str, end_str = sql_bounds(start_dt, end_dt)
+
+    summary_df = pd.read_sql(
+        """SELECT COALESCE(e.emp_code, 'N/A') AS 'Employee ID',
+                  COALESCE(e.name, 'General / Unlinked Expense') AS 'Employee Name',
+                  COALESCE(e.dept, 'General') AS 'Department',
+                  COUNT(DISTINCT s.id) AS 'Total Transactions',
+                  SUM(si.qty * si.retail_price) AS 'Total Amount (PKR)'
+           FROM sales s
+           JOIN sale_items si ON s.id = si.sale_id
+           LEFT JOIN employees e ON s.emp_id = e.id
+           WHERE s.payment_type = ?
+             AND s.sale_date BETWEEN ? AND ?
+           GROUP BY s.emp_id
+           ORDER BY e.name""",
+        conn,
+        params=(payment_type, start_str, end_str),
+    )
+
+    if summary_df.empty:
+        st.info(f"No '{payment_type}' records found for this date range.")
+        return
+
+    st.dataframe(summary_df, use_container_width=True)
+    st.metric("Total", f"PKR {summary_df['Total Amount (PKR)'].sum():,.2f}")
+
+    detailed_df = pd.read_sql(
+        """SELECT s.sale_date AS 'Date & Time',
+                  COALESCE(e.emp_code, 'N/A') AS 'Employee ID',
+                  COALESCE(e.name, 'General') AS 'Employee Name',
+                  COALESCE(e.dept, 'General') AS 'Department',
+                  p.name AS 'Item', si.qty AS 'Quantity',
+                  si.retail_price AS 'Unit Price (PKR)', (si.qty * si.retail_price) AS 'Total (PKR)'
+           FROM sales s
+           JOIN sale_items si ON s.id = si.sale_id
+           JOIN products p ON si.product_id = p.id
+           LEFT JOIN employees e ON s.emp_id = e.id
+           WHERE s.payment_type = ?
+             AND s.sale_date BETWEEN ? AND ?
+           ORDER BY s.sale_date DESC""",
+        conn,
+        params=(payment_type, start_str, end_str),
+    )
+
+    excel_out = to_excel_bytes({"Summary": summary_df, "Detailed Log": detailed_df})
+    st.download_button(
+        f"📥 Download {payment_type} Report (.xlsx)",
+        data=excel_out,
+        file_name=f"{payment_type.replace(' ', '_')}_Report_{start_dt}_to_{end_dt}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"{key_prefix}_download",
+    )
+
+
+# =====================================================================
 # MODULE: SETTINGS (shop info + receipt / printer config)
 # =====================================================================
 
@@ -1257,7 +1734,7 @@ def main() -> None:
         ("hospital", "Hospital Expense"),
         ("ot", "OT Expense"),
         ("reports", "Profit & Sales Reports"),
-    
+        ("reports_center", "Reports Center"),
     ]
 
     for permission, label in permission_to_menu:
@@ -1303,6 +1780,8 @@ def main() -> None:
             module_ot_expense(conn)
         elif menu == "Profit & Sales Reports":
             module_reports(conn)
+        elif menu == "Reports Center":
+            module_full_reports(conn)
         elif menu == "Excel Reports":
             module_reports(conn)
         elif menu == "Settings":
