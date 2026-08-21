@@ -18,68 +18,105 @@ import json
 import secrets
 import sqlite3
 from datetime import date, datetime, timedelta
-
+import libsql_client
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-DB_PATH = "canteen.db"
+# Compatibility fix for older Streamlit versions
+if not hasattr(st, "rerun"):
+    st.rerun = st.experimental_rerun
 
 # Payment types that must be tied to a specific employee (deducted from their account)
 EMPLOYEE_LINKED_PAYMENT_TYPES = [
     "Employee Tab (Monthly Account)",
-    
 ]
 
 # =====================================================================
 # DATABASE LAYER
 # =====================================================================
 
-def get_conn() -> sqlite3.Connection:
-    """Open a new connection with sane defaults (safe for Streamlit reruns)."""
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
 
+# Inside get_conn():
+def get_conn():
+    # Convert libsql:// to https:// or explicitly provide the https URL
+    url = st.secrets["TURSO_URL"].replace("libsql://", "https://")
+    return libsql_client.create_client_sync(
+        url=url, auth_token=st.secrets["TURSO_AUTH_TOKEN"]
+    )
+    
+def query_to_dataframe(
+    query: str, conn=None, params: list = None
+) -> pd.DataFrame:
+    """Executes a SQL query using libsql_client and returns a pandas DataFrame."""
+    if isinstance(conn, (list, tuple)):
+        params = conn
+        conn = None
+
+    if params is None:
+        params = []
+    elif not isinstance(params, (list, tuple)):
+        params = [params]
+
+    should_close = False
+    if conn is None:
+        conn = get_conn()
+        should_close = True
+
+    try:
+        res = conn.execute(query, params)
+        columns = res.columns
+        rows = [list(row) for row in res.rows]
+        return pd.DataFrame(rows, columns=columns)
+    except KeyError:
+        st.error(
+            f"Database Execution Error: Turso rejected query: `{query}`. Verify table and column names exist."
+        )
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Database Error: {e}")
+        return pd.DataFrame()
+    finally:
+        if should_close:
+            conn.close()
 
 def init_db() -> None:
     conn = get_conn()
-    c = conn.cursor()
 
-    c.execute('''CREATE TABLE IF NOT EXISTS users (
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     username TEXT UNIQUE NOT NULL,
                     password_hash TEXT NOT NULL,
                     salt TEXT NOT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )''')
+                )""")
 
-    c.execute('''CREATE TABLE IF NOT EXISTS products (
+    conn.execute("""CREATE TABLE IF NOT EXISTS products (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     barcode TEXT UNIQUE,
                     name TEXT UNIQUE NOT NULL,
                     cost_price REAL NOT NULL,
                     retail_price REAL NOT NULL,
                     stock_qty INTEGER NOT NULL DEFAULT 0
-                )''')
+                )""")
 
-    c.execute('''CREATE TABLE IF NOT EXISTS employees (
+    conn.execute("""CREATE TABLE IF NOT EXISTS employees (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     emp_code TEXT UNIQUE NOT NULL,
                     name TEXT NOT NULL,
                     dept TEXT
-                )''')
+                )""")
 
-    c.execute('''CREATE TABLE IF NOT EXISTS sales (
+    conn.execute("""CREATE TABLE IF NOT EXISTS sales (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     payment_type TEXT NOT NULL,
                     emp_id INTEGER,
                     total_amount REAL NOT NULL,
                     sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY(emp_id) REFERENCES employees(id)
-                )''')
+                )""")
 
-    c.execute('''CREATE TABLE IF NOT EXISTS sale_items (
+    conn.execute("""CREATE TABLE IF NOT EXISTS sale_items (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     sale_id INTEGER NOT NULL,
                     product_id INTEGER NOT NULL,
@@ -88,23 +125,23 @@ def init_db() -> None:
                     retail_price REAL NOT NULL,
                     FOREIGN KEY(sale_id) REFERENCES sales(id),
                     FOREIGN KEY(product_id) REFERENCES products(id)
-                )''')
+                )""")
 
-    c.execute('''CREATE TABLE IF NOT EXISTS settings (
+    conn.execute("""CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT
-                )''')
+                )""")
 
-    c.execute('''CREATE TABLE IF NOT EXISTS employee_payments (
+    conn.execute("""CREATE TABLE IF NOT EXISTS employee_payments (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     emp_id INTEGER NOT NULL,
                     amount REAL NOT NULL,
                     payment_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     note TEXT,
                     FOREIGN KEY(emp_id) REFERENCES employees(id)
-                )''')
+                )""")
 
-    c.execute('''CREATE TABLE IF NOT EXISTS returns (
+    conn.execute("""CREATE TABLE IF NOT EXISTS returns (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     sale_id INTEGER NOT NULL,
                     sale_item_id INTEGER NOT NULL,
@@ -116,16 +153,14 @@ def init_db() -> None:
                     FOREIGN KEY(sale_id) REFERENCES sales(id),
                     FOREIGN KEY(sale_item_id) REFERENCES sale_items(id),
                     FOREIGN KEY(product_id) REFERENCES products(id)
-                )''')
+                )""")
 
-    conn.commit()
     conn.close()
     migrate_db()
 
 
-
 def reset_all_data() -> None:
-    """Permanently delete all application data from the SQLite database."""
+    """Permanently delete all application data from the database."""
     conn = get_conn()
     try:
         # Delete child records first because foreign-key enforcement is enabled.
@@ -143,7 +178,6 @@ def reset_all_data() -> None:
         conn.commit()
     finally:
         conn.close()
-
 # ---------------- Settings (shop name / receipt config) ----------------
 
 DEFAULT_SETTINGS = {
@@ -154,60 +188,53 @@ DEFAULT_SETTINGS = {
     "paper_width_mm": "80",
 }
 
-
-def get_setting(key: str) -> str:
+def get_setting(key: str, default: str = "") -> str:
     conn = get_conn()
-    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-    conn.close()
-    return row[0] if row else DEFAULT_SETTINGS.get(key, "")
+    try:
+        res = conn.execute("SELECT value FROM settings WHERE key = ?", [key])
+        return res.rows[0][0] if res.rows else default
+    finally:
+        conn.close()
+
+
+def set_setting(key: str, value: str) -> None:
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [key, value],
+        )
+    finally:
+        conn.close()
 
 
 def get_all_settings() -> dict:
     return {k: get_setting(k) for k in DEFAULT_SETTINGS}
 
 
-def set_setting(key: str, value: str) -> None:
-    conn = get_conn()
-    conn.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (key, value),
-    )
-    conn.commit()
-    conn.close()
-
 
 def migrate_db() -> None:
-    """Adds columns that didn't exist in earlier versions of this app,
-    without touching or deleting any existing data."""
     conn = get_conn()
-    c = conn.cursor()
+    try:
+        # Check existing columns in products table
+        res = conn.execute("PRAGMA table_info(products)")
+        # libsql_client returns ResultSet objects containing Row objects
+        columns = [row[1] for row in res.rows]
 
-    user_cols = {row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()}
-    if "role" not in user_cols:
-        c.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
-        conn.commit()
-    user_cols = {row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()}
-    if "permissions" not in user_cols:
-        c.execute("ALTER TABLE users ADD COLUMN permissions TEXT NOT NULL DEFAULT '{}'")
-        conn.commit()
+        if "barcode" not in columns:
+            conn.execute("ALTER TABLE products ADD COLUMN barcode TEXT")
 
-    existing_cols = {row[1] for row in c.execute("PRAGMA table_info(products)").fetchall()}
-    if "barcode" not in existing_cols:
-        c.execute("ALTER TABLE products ADD COLUMN barcode TEXT")
-        conn.commit()
-        # SQLite can't add a UNIQUE column via ALTER TABLE, so enforce
-        # uniqueness with an index instead (NULLs are still allowed to repeat).
-        try:
-            c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode)")
-            conn.commit()
-        except sqlite3.IntegrityError:
-            # Existing duplicate barcodes (e.g. blank strings) - skip enforcing
-            # uniqueness rather than crashing; new inserts will still be checked
-            # once duplicates are cleaned up.
-            pass
+        if "stock_qty" not in columns:
+            conn.execute(
+                "ALTER TABLE products ADD COLUMN stock_qty INTEGER NOT NULL DEFAULT 0"
+            )
 
-    conn.close()
+        # Ensure index on barcode
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode) WHERE barcode IS NOT NULL"
+        )
+    finally:
+        conn.close()
 
 
 # =====================================================================
@@ -255,19 +282,42 @@ def user_has_permission(permission: str) -> bool:
     return permission in normalize_permissions(st.session_state.get("permissions", []))
 
 
-def get_user_permissions(username: str) -> list[str]:
+def get_user_permissions(username: str) -> list:
     conn = get_conn()
-    row = conn.execute(
-        "SELECT role, COALESCE(permissions, '{}') FROM users WHERE username = ?",
-        (username.strip(),)
-    ).fetchone()
-    conn.close()
-    if not row:
+    try:
+        res = conn.execute(
+            "SELECT permissions FROM users WHERE username = ?", [username]
+        )
+        if res.rows and res.rows[0][0]:
+            # Convert JSON string or comma-separated list into a python list
+            val = res.rows[0][0]
+            if isinstance(val, str):
+                try:
+                    return json.loads(val)
+                except Exception:
+                    return [p.strip() for p in val.split(",") if p.strip()]
+            return list(val)
         return []
-    role, permissions = row
-    return list(ACCESS_OPTIONS.keys()) if role == "admin" else normalize_permissions(permissions)
+    except Exception:
+        # Fallback if 'permissions' column doesn't exist in the users table
+        return []
+    finally:
+        conn.close()
 
-
+def set_user_permissions(username: str, permissions: list) -> bool:
+    conn = get_conn()
+    try:
+        perms_json = json.dumps(permissions)
+        conn.execute(
+            "UPDATE users SET permissions = ? WHERE username = ?",
+            [perms_json, username],
+        )
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+        
 def save_user_permissions(username: str, permissions: list[str]) -> None:
     conn = get_conn()
     conn.execute(
@@ -288,53 +338,77 @@ def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
     pwd_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
     return pwd_hash, salt
 
+# =====================================================================
+# AUTH / USER HELPERS
+# =====================================================================
+
 
 def any_user_exists() -> bool:
-    conn = get_conn()
-    n = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    conn.close()
-    return n > 0
-
-
-def create_user(
-    username: str,
-    password: str,
-    role: str = "admin",
-    permissions: list[str] | None = None,
-) -> tuple[bool, str]:
-    pwd_hash, salt = hash_password(password)
-    if permissions is None:
-        permissions = list(ACCESS_OPTIONS.keys()) if role == "admin" else []
-    permissions_json = json.dumps(normalize_permissions(permissions))
+    """Check if any admin/user account exists in the system."""
     conn = get_conn()
     try:
-        conn.execute(
-            "INSERT INTO users (username, password_hash, salt, role, permissions) VALUES (?, ?, ?, ?, ?)",
-            (username.strip(), pwd_hash, salt, role, permissions_json),
-        )
-        conn.commit()
-        return True, "Account created."
-    except sqlite3.IntegrityError:
-        return False, "That username already exists."
+        res = conn.execute("SELECT COUNT(*) FROM users")
+        n = res.rows[0][0] if res.rows else 0
+        return n > 0
     finally:
         conn.close()
 
 
-def verify_login(username: str, password: str) -> tuple[bool, str, list[str]]:
+def get_user_by_username(username: str):
+    """Retrieve user credentials safely using libsql_client."""
     conn = get_conn()
-    row = conn.execute(
-        "SELECT password_hash, salt, COALESCE(role, 'admin'), COALESCE(permissions, '{}') "
-        "FROM users WHERE username = ?",
-        (username.strip(),)
-    ).fetchone()
-    conn.close()
-    if not row:
-        return False, "", []
-    stored_hash, salt, role, permissions = row
-    candidate_hash, _ = hash_password(password, salt)
-    ok = secrets.compare_digest(candidate_hash, stored_hash)
-    perms = list(ACCESS_OPTIONS.keys()) if role == "admin" else normalize_permissions(permissions)
-    return ok, role, perms
+    try:
+        res = conn.execute(
+            "SELECT id, username, password_hash, salt FROM users WHERE username = ?",
+            [username],
+        )
+        return res.rows[0] if res.rows else None
+    finally:
+        conn.close()
+
+
+def create_user(username: str, password_raw: str) -> bool:
+    """Create a new user with salted PBKDF2 hash."""
+    salt = secrets.token_hex(16)
+    password_hash = hashlib.pbkdf2_hmac(
+        "sha256", password_raw.encode(), salt.encode(), 100000
+    ).hex()
+
+    conn = get_conn()
+    try:
+        conn.execute(
+            "INSERT INTO users (username, password_hash, salt) VALUES (?, ?, ?)",
+            [username, password_hash, salt],
+        )
+        return True
+    except Exception:
+        return False
+    finally:
+        conn.close()
+
+
+def verify_password(stored_hash: str, salt: str, password_raw: str) -> bool:
+    """Verify password match."""
+    computed_hash = hashlib.pbkdf2_hmac(
+        "sha256", password_raw.encode(), salt.encode(), 100000
+    ).hex()
+    return secrets.compare_digest(stored_hash, computed_hash)
+
+
+def verify_login(username: str, password_raw: str):
+    user = get_user_by_username(username)
+    if not user:
+        return False, None, []
+
+    # libsql_client rows can be accessed by index or column name
+    # Scheme: id, username, password_hash, salt
+    stored_hash = user[2]
+    salt = user[3]
+
+    if verify_password(stored_hash, salt, password_raw):
+        return True, "admin", ["all"]
+
+    return False, None, []
 
 
 def login_gate() -> bool:
@@ -466,7 +540,9 @@ def sql_bounds(start: date, end: date) -> tuple[str, str]:
 # EMPLOYEE PAYMENTS (CREDITS AGAINST THE MONTHLY TAB)
 # =====================================================================
 
-def add_employee_payment(conn: sqlite3.Connection, emp_id: int, amount: float, payment_date: date, note: str) -> None:
+def add_employee_payment(
+    conn, emp_id: int, amount: float, payment_date: date, note: str
+) -> None:
     conn.execute(
         "INSERT INTO employee_payments (emp_id, amount, payment_date, note) VALUES (?, ?, ?, ?)",
         (emp_id, amount, f"{payment_date} 00:00:00", note.strip()),
@@ -566,8 +642,9 @@ def module_pos(conn: sqlite3.Connection) -> None:
     st.header("🛒 Point of Sale & Checkout")
     st.info("Paid bills cannot be edited. Use **Return Paid Sale** to process a return without changing the original bill.")
 
-    products = pd.read_sql("SELECT * FROM products WHERE stock_qty > 0", conn)
-    employees = pd.read_sql("SELECT * FROM employees", conn)
+    products = query_to_dataframe(
+    "SELECT * FROM products WHERE stock_qty > 0", conn=conn)
+    employees = query_to_dataframe("SELECT * FROM employees", conn=conn)
 
     if products.empty:
         st.warning("No items available in inventory. Please add products first.")
@@ -828,9 +905,9 @@ def module_returns(conn: sqlite3.Connection) -> None:
         if st.button("🔍 Find Sale"):
             st.session_state["return_sale_id"] = int(sid_input)
     else:
-        recent_sales = pd.read_sql(
+        recent_sales = query_to_dataframe(
             "SELECT id, sale_date, payment_type, total_amount FROM sales ORDER BY sale_date DESC LIMIT 50",
-            conn,
+            conn=conn
         )
         if recent_sales.empty:
             st.info("No sales recorded yet.")
@@ -848,7 +925,7 @@ def module_returns(conn: sqlite3.Connection) -> None:
         st.info("Please enter or select a Sale ID above to begin.")
         return  # Replaced st.stop() with return to prevent session state resets
 
-    sale_row_df = pd.read_sql("SELECT * FROM sales WHERE id = ?", conn, params=(sale_id,))
+    sale_row_df = query_to_dataframe("SELECT * FROM sales WHERE id = ?", conn=conn, params=(sale_id,))
     if sale_row_df.empty:
         st.error(f"No sale found with ID {sale_id}.")
         return
@@ -856,8 +933,8 @@ def module_returns(conn: sqlite3.Connection) -> None:
 
     emp_label = None
     if sale_row["emp_id"] is not None and not pd.isna(sale_row["emp_id"]):
-        emp_df = pd.read_sql(
-            "SELECT emp_code, name FROM employees WHERE id = ?", conn, params=(int(sale_row["emp_id"]),)
+        emp_df = query_to_dataframe(
+            "SELECT emp_code, name FROM employees WHERE id = ?", conn=conn, params=(int(sale_row["emp_id"]),)
         )
         if not emp_df.empty:
             emp_label = f"{emp_df.iloc[0]['emp_code']} - {emp_df.iloc[0]['name']}"
@@ -871,13 +948,13 @@ def module_returns(conn: sqlite3.Connection) -> None:
     if emp_label:
         st.caption(f"Employee: {emp_label}")
 
-    items_df = pd.read_sql(
+    items_df = query_to_dataframe(
         """SELECT si.id AS sale_item_id, si.product_id, p.name, si.qty, si.retail_price,
                   COALESCE((SELECT SUM(qty) FROM returns WHERE sale_item_id = si.id), 0) AS already_returned
            FROM sale_items si
            JOIN products p ON si.product_id = p.id
            WHERE si.sale_id = ?""",
-        conn,
+        conn=conn,
         params=(sale_id,),
     )
 
@@ -946,14 +1023,14 @@ def module_returns(conn: sqlite3.Connection) -> None:
 
     st.divider()
     st.subheader("🧾 Return History for This Sale")
-    history_df = pd.read_sql(
+    history_df = query_to_dataframe(
         """SELECT r.return_date AS 'Date', p.name AS 'Item', r.qty AS 'Qty',
                   r.refund_amount AS 'Refund (PKR)', r.note AS 'Note'
            FROM returns r
            JOIN products p ON r.product_id = p.id
            WHERE r.sale_id = ?
            ORDER BY r.return_date DESC""",
-        conn,
+        conn=conn,
         params=(sale_id,),
     )
     if history_df.empty:
@@ -975,12 +1052,12 @@ def module_inventory(conn: sqlite3.Connection) -> None:
 
     # ---------------- Current stock ----------------
     with tab1:
-        df = pd.read_sql(
+        df = query_to_dataframe(
             """SELECT id AS 'Item ID', barcode AS 'Barcode', name AS 'Item Name',
                       cost_price AS 'Cost Price (PKR)', retail_price AS 'Retail Price (PKR)',
                       stock_qty AS 'Stock Quantity'
                FROM products ORDER BY name""",
-            conn,
+            conn=conn
         )
         st.dataframe(df, use_container_width=True)
 
@@ -1033,7 +1110,7 @@ def module_inventory(conn: sqlite3.Connection) -> None:
             "Use this to fix a mistake — the values you enter here REPLACE the "
             "current price and stock quantity (they are not added on top)."
         )
-        p_df = pd.read_sql("SELECT * FROM products ORDER BY name", conn)
+        p_df = query_to_dataframe("SELECT * FROM products ORDER BY name", conn=conn)
 
         if p_df.empty:
             st.info("No products yet. Add one in the 'Add New Item' tab first.")
@@ -1092,7 +1169,7 @@ def module_inventory(conn: sqlite3.Connection) -> None:
         start_dt, end_dt = date_range_picker("inv")
         start_str, end_str = sql_bounds(start_dt, end_dt)
 
-        current_inv_df = pd.read_sql(
+        current_inv_df = query_to_dataframe(
             """SELECT name AS 'Item Name', barcode AS 'Barcode',
                       cost_price AS 'Unit Cost (PKR)', retail_price AS 'Unit Retail (PKR)',
                       stock_qty AS 'Current Stock Qty',
@@ -1102,7 +1179,7 @@ def module_inventory(conn: sqlite3.Connection) -> None:
             conn,
         )
 
-        movement_df = pd.read_sql(
+        movement_df = query_to_dataframe(
             """SELECT p.name AS 'Item Name',
                       SUM(si.qty) AS 'Units Sold In Period',
                       SUM(si.qty * si.cost_price) AS 'Total Cost Value (PKR)',
@@ -1114,7 +1191,7 @@ def module_inventory(conn: sqlite3.Connection) -> None:
                WHERE s.sale_date BETWEEN ? AND ?
                GROUP BY p.id
                ORDER BY p.name""",
-            conn,
+            conn=conn,
             params=(start_str, end_str),
         )
 
@@ -1180,7 +1257,7 @@ def module_employee_ledger(conn: sqlite3.Connection) -> None:
 
         st.divider()
         st.subheader("Remove Employee")
-        emp_df_all = pd.read_sql("SELECT * FROM employees ORDER BY name", conn)
+        emp_df_all = query_to_dataframe("SELECT * FROM employees ORDER BY name", conn)
         if not emp_df_all.empty:
             del_emp = st.selectbox(
                 "Select Employee to Delete",
@@ -1207,9 +1284,9 @@ def module_employee_ledger(conn: sqlite3.Connection) -> None:
 # =====================================================================
 
 def _get_employee_debit_credit_summary(conn: sqlite3.Connection, start_str: str, end_str: str) -> pd.DataFrame:
-    employees_df = pd.read_sql("SELECT id, emp_code, name, dept FROM employees ORDER BY name", conn)
+    employees_df = query_to_dataframe("SELECT id, emp_code, name, dept FROM employees ORDER BY name", conn=conn)
 
-    debit_df = pd.read_sql(
+    debit_df = query_to_dataframe(
         """SELECT s.emp_id AS id, SUM(si.qty * si.retail_price) AS debit_total
            FROM sales s
            JOIN sale_items si ON s.id = si.sale_id
@@ -1219,7 +1296,7 @@ def _get_employee_debit_credit_summary(conn: sqlite3.Connection, start_str: str,
         conn,
         params=(start_str, end_str),
     )
-    credit_df = pd.read_sql(
+    credit_df = query_to_dataframe(
         """SELECT emp_id AS id, SUM(amount) AS credit_total
            FROM employee_payments
            WHERE payment_date BETWEEN ? AND ?
@@ -1236,7 +1313,7 @@ def _get_employee_debit_credit_summary(conn: sqlite3.Connection, start_str: str,
 
 
 def _get_employee_debit_credit_detail(conn: sqlite3.Connection, emp_id: int, start_str: str, end_str: str) -> pd.DataFrame:
-    debit_rows = pd.read_sql(
+    debit_rows = query_to_dataframe(
         """SELECT s.sale_date AS date_sort, s.sale_date AS 'Date',
                   'Debit (Purchase)' AS 'Type', p.name AS 'Description',
                   (si.qty * si.retail_price) AS 'Amount (PKR)'
@@ -1248,7 +1325,7 @@ def _get_employee_debit_credit_detail(conn: sqlite3.Connection, emp_id: int, sta
         conn,
         params=(emp_id, start_str, end_str),
     )
-    credit_rows = pd.read_sql(
+    credit_rows = query_to_dataframe(
         """SELECT payment_date AS date_sort, payment_date AS 'Date',
                   'Credit (Payment)' AS 'Type',
                   COALESCE(NULLIF(note, ''), 'Payment received') AS 'Description',
@@ -1275,7 +1352,7 @@ def _render_employee_ledger_content(
 ) -> None:
     start_str, end_str = sql_bounds(start_dt, end_dt)
 
-    employees = pd.read_sql("SELECT * FROM employees ORDER BY name", conn)
+    employees = query_to_dataframe("SELECT * FROM employees ORDER BY name", conn=conn)
     if employees.empty:
         st.info("No employees registered yet.")
         return
@@ -1337,7 +1414,7 @@ def _render_employee_ledger_content(
     m3.metric("Outstanding Balance", f"PKR {balance:,.2f}")
 
     if show_actions:
-        raw_payments = pd.read_sql(
+        raw_payments = query_to_dataframe(
             """SELECT id, payment_date, amount, note FROM employee_payments
                WHERE emp_id = ? AND payment_date BETWEEN ? AND ?
                ORDER BY payment_date DESC""",
@@ -1391,7 +1468,7 @@ def _render_employee_ledger_content(
         ]
         st.dataframe(display_df, use_container_width=True)
 
-        detailed_debits = pd.read_sql(
+        detailed_debits = query_to_dataframe(
             """SELECT s.sale_date AS 'Date', e.emp_code AS 'Employee ID', e.name AS 'Employee Name',
                       'Debit (Purchase)' AS 'Type', p.name AS 'Description',
                       (si.qty * si.retail_price) AS 'Amount (PKR)'
@@ -1404,7 +1481,7 @@ def _render_employee_ledger_content(
             conn,
             params=(start_str, end_str),
         )
-        detailed_credits = pd.read_sql(
+        detailed_credits = query_to_dataframe(
             """SELECT ep.payment_date AS 'Date', e.emp_code AS 'Employee ID', e.name AS 'Employee Name',
                       'Credit (Payment)' AS 'Type',
                       COALESCE(NULLIF(ep.note, ''), 'Payment received') AS 'Description',
@@ -1443,8 +1520,8 @@ def _render_payment_type_ledger(conn: sqlite3.Connection, payment_type: str, key
     start_dt, end_dt = date_range_picker(key_prefix)
     start_str, end_str = sql_bounds(start_dt, end_dt)
 
-    employees = pd.read_sql("SELECT * FROM employees ORDER BY name", conn)
-    
+    employees = query_to_dataframe("SELECT * FROM employees ORDER BY name", conn=conn)
+
     # Build selection list with an option for general/unlinked expenses
     emp_options = ["All / General (No Employee)"]
     if not employees.empty:
@@ -1458,7 +1535,7 @@ def _render_payment_type_ledger(conn: sqlite3.Connection, payment_type: str, key
 
     # Filter query based on employee selection
     if emp_sel == "All / General (No Employee)":
-        ledger_df = pd.read_sql(
+        ledger_df = query_to_dataframe(
             """SELECT s.sale_date AS 'Date & Time', 
                       COALESCE(e.name, 'General / Unlinked') AS 'Employee',
                       p.name AS 'Item Name', si.qty AS 'Quantity',
@@ -1477,7 +1554,7 @@ def _render_payment_type_ledger(conn: sqlite3.Connection, payment_type: str, key
     else:
         selected_code = emp_sel.split(" - ")[0]
         emp_id = int(employees[employees["emp_code"] == selected_code]["id"].values[0])
-        ledger_df = pd.read_sql(
+        ledger_df = query_to_dataframe(
             """SELECT s.sale_date AS 'Date & Time', p.name AS 'Item Name', si.qty AS 'Quantity',
                       si.retail_price AS 'Unit Price (PKR)',
                       (si.qty * si.retail_price) AS 'Total Bill (PKR)'
@@ -1499,7 +1576,7 @@ def _render_payment_type_ledger(conn: sqlite3.Connection, payment_type: str, key
     st.header("📑 Expense Summary Export")
     st.caption(f"Using the date range selected above: {start_dt} to {end_dt}")
 
-    summary_df = pd.read_sql(
+    summary_df = query_to_dataframe(
         """SELECT COALESCE(e.emp_code, 'N/A') AS 'Employee ID', 
                   COALESCE(e.name, 'General / Unlinked Expense') AS 'Employee Name', 
                   COALESCE(e.dept, 'General') AS 'Department',
@@ -1516,7 +1593,7 @@ def _render_payment_type_ledger(conn: sqlite3.Connection, payment_type: str, key
         params=(payment_type, start_str, end_str),
     )
 
-    detailed_df = pd.read_sql(
+    detailed_df = query_to_dataframe(
         """SELECT s.sale_date AS 'Date & Time', 
                   COALESCE(e.emp_code, 'N/A') AS 'Employee ID', 
                   COALESCE(e.name, 'General') AS 'Employee Name',
@@ -1581,7 +1658,7 @@ def module_reports(conn: sqlite3.Connection) -> None:
     start_dt, end_dt = date_range_picker("sales_report")
     start_str, end_str = sql_bounds(start_dt, end_dt)
 
-    report_df = pd.read_sql(
+    report_df = query_to_dataframe(
         """SELECT p.name AS 'Product Name',
                   SUM(si.qty) AS 'Units Sold',
                   SUM(si.qty * si.cost_price) AS 'Total Cost (PKR)',
@@ -1641,7 +1718,7 @@ def module_full_reports(conn: sqlite3.Connection) -> None:
 
     # ---------------- Sales Report ----------------
     with tab1:
-        report_df = pd.read_sql(
+        report_df = query_to_dataframe(
             """SELECT p.name AS 'Product Name',
                       SUM(si.qty) AS 'Units Sold',
                       SUM(si.qty * si.cost_price) AS 'Total Cost (PKR)',
@@ -1676,7 +1753,7 @@ def module_full_reports(conn: sqlite3.Connection) -> None:
 
     # ---------------- Employee Ledger (debit/credit) ----------------
     with tab2:
-        employees = pd.read_sql("SELECT * FROM employees ORDER BY name", conn)
+        employees =query_to_dataframe("SELECT * FROM employees ORDER BY name", conn)
         if employees.empty:
             st.info("No employees registered yet.")
         else:
@@ -1704,7 +1781,7 @@ def _render_expense_summary_only(
     (no employee-registration UI, since that's not the point of this page)."""
     start_str, end_str = sql_bounds(start_dt, end_dt)
 
-    summary_df = pd.read_sql(
+    summary_df = query_to_dataframe(
         """SELECT COALESCE(e.emp_code, 'N/A') AS 'Employee ID',
                   COALESCE(e.name, 'General / Unlinked Expense') AS 'Employee Name',
                   COALESCE(e.dept, 'General') AS 'Department',
@@ -1728,7 +1805,7 @@ def _render_expense_summary_only(
     st.dataframe(summary_df, use_container_width=True)
     st.metric("Total", f"PKR {summary_df['Total Amount (PKR)'].sum():,.2f}")
 
-    detailed_df = pd.read_sql(
+    detailed_df = query_to_dataframe(
         """SELECT s.sale_date AS 'Date & Time',
                   COALESCE(e.emp_code, 'N/A') AS 'Employee ID',
                   COALESCE(e.name, 'General') AS 'Employee Name',
@@ -1797,12 +1874,11 @@ def module_settings() -> None:
         "editing, Settings, and Reset All Data are never granted to a Shop Keeper."
     )
 
-    shop_conn = get_conn()
-    shop_user_options = pd.read_sql(
-        "SELECT username FROM users WHERE role = 'shop' ORDER BY username", shop_conn
+    shop_user_options = query_to_dataframe(
+    "SELECT username FROM users ORDER BY username"
     )
-    shop_conn.close()
-    if not shop_user_options.empty:
+
+    if not shop_user_options.empty and "username" in shop_user_options.columns:
         selected_shop = st.selectbox(
             "Manage Existing Shop Keeper",
             shop_user_options["username"].tolist(),
