@@ -1,5 +1,0 @@
-streamlit
-pandas
-openpyxl
-libsql-experimental
-libsql-client
