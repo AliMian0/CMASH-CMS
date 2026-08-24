@@ -116,8 +116,16 @@ def get_conn() -> _TursoConn:
     """Opens a connection to the persistent Turso (libSQL) database
     configured in .streamlit/secrets.toml. This is what makes data survive
     app restarts/redeploys - unlike a local SQLite file, which Streamlit
-    Community Cloud wipes on every reboot."""
+    Community Cloud wipes on every reboot.
+
+    Uses the https:// scheme (not libsql://) so libsql_client talks over
+    plain HTTP instead of a WebSocket. Streamlit Community Cloud's network
+    frequently fails the WebSocket handshake for wss://, causing
+    aiohttp.client_exceptions.WSServerHandshakeError - the HTTP transport
+    avoids that entirely and works reliably in this environment."""
     url = st.secrets["TURSO_URL"]
+    if url.startswith("libsql://"):
+        url = "https://" + url[len("libsql://"):]
     client = libsql_client.create_client_sync(
         url=url, auth_token=st.secrets["TURSO_AUTH_TOKEN"]
     )
