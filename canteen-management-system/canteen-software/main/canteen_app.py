@@ -37,14 +37,100 @@ EMPLOYEE_LINKED_PAYMENT_TYPES = [
 # =====================================================================
 
 
-# Inside get_conn():
-def get_conn():
-    # Convert libsql:// to https:// or explicitly provide the https URL
-    url = st.secrets["TURSO_URL"].replace("libsql://", "https://")
-    return libsql_client.create_client_sync(
+class _TursoCursor:
+    """Mimics the small slice of sqlite3.Cursor's API this app uses
+    (execute / fetchone / fetchall / lastrowid), backed by a libsql_client
+    sync Client. libsql_client's ResultSet doesn't have a Python
+    sqlite3-style .lastrowid, so INSERTs are transparently rewritten to add
+    'RETURNING id' and we read the id back from the normal row data."""
+
+    def __init__(self, client):
+        self._client = client
+        self.lastrowid = None
+        self._result = None
+
+    def execute(self, sql, params=None):
+        params = list(params) if params else []
+        stripped = sql.strip()
+        upper = stripped.upper()
+
+        is_insert = upper.startswith("INSERT")
+        if is_insert and "RETURNING" not in upper:
+            stripped = stripped.rstrip().rstrip(";") + " RETURNING id"
+
+        self._result = self._client.execute(stripped, params)
+
+        if is_insert:
+            self.lastrowid = self._result.rows[0][0] if self._result.rows else None
+
+        return self
+
+    def fetchone(self):
+        return self._result.rows[0] if self._result and self._result.rows else None
+
+    def fetchall(self):
+        return list(self._result.rows) if self._result else []
+
+    @property
+    def columns(self):
+        return self._result.columns if self._result else []
+
+    @property
+    def rows(self):
+        return self._result.rows if self._result else []
+
+    @property
+    def description(self):
+        # Minimal DBAPI2-style description shape: [(name, ...), ...]
+        return [(c,) for c in self.columns]
+
+
+class _TursoConn:
+    """Wraps a libsql_client sync Client to look like sqlite3.Connection
+    (execute / cursor / commit / close) so the rest of this app - written
+    against that API - works unchanged against Turso.
+
+    libsql_client auto-commits every execute() call over HTTP (there is no
+    open multi-statement transaction to commit unless you explicitly use
+    client.transaction()), so commit() here is a safe no-op."""
+
+    def __init__(self, client):
+        self._client = client
+
+    def execute(self, sql, params=None) -> _TursoCursor:
+        cur = self.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def cursor(self) -> _TursoCursor:
+        return _TursoCursor(self._client)
+
+    def commit(self) -> None:
+        pass  # each execute() already commits; nothing to do
+
+    def close(self) -> None:
+        self._client.close()
+
+
+def get_conn() -> _TursoConn:
+    """Opens a connection to the persistent Turso (libSQL) database
+    configured in .streamlit/secrets.toml. This is what makes data survive
+    app restarts/redeploys - unlike a local SQLite file, which Streamlit
+    Community Cloud wipes on every reboot."""
+    url = st.secrets["TURSO_URL"]
+    client = libsql_client.create_client_sync(
         url=url, auth_token=st.secrets["TURSO_AUTH_TOKEN"]
     )
-    
+    return _TursoConn(client)
+
+
+def _is_unique_violation(exc: Exception) -> bool:
+    """libsql_client doesn't raise sqlite3.IntegrityError, so we detect a
+    UNIQUE-constraint violation by message text instead of exception type."""
+    msg = str(exc).lower()
+    return "unique" in msg and ("constraint" in msg or "violat" in msg)
+
+
 def query_to_dataframe(
     query: str, conn=None, params: list = None
 ) -> pd.DataFrame:
@@ -88,6 +174,8 @@ def init_db() -> None:
                     username TEXT UNIQUE NOT NULL,
                     password_hash TEXT NOT NULL,
                     salt TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'admin',
+                    permissions TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )""")
 
@@ -233,6 +321,19 @@ def migrate_db() -> None:
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_products_barcode ON products(barcode) WHERE barcode IS NOT NULL"
         )
+
+        # Check existing columns in users table (older databases created
+        # before role-based access was added won't have these yet).
+        res_users = conn.execute("PRAGMA table_info(users)")
+        user_columns = [row[1] for row in res_users.rows]
+
+        if "role" not in user_columns:
+            # Any account that already exists was created via the original
+            # "admin" setup flow, so it's correct to default it to admin.
+            conn.execute("ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'admin'")
+
+        if "permissions" not in user_columns:
+            conn.execute("ALTER TABLE users ADD COLUMN permissions TEXT")
     finally:
         conn.close()
 
@@ -355,11 +456,11 @@ def any_user_exists() -> bool:
 
 
 def get_user_by_username(username: str):
-    """Retrieve user credentials safely using libsql_client."""
+    """Retrieve user credentials (including role/permissions) safely."""
     conn = get_conn()
     try:
         res = conn.execute(
-            "SELECT id, username, password_hash, salt FROM users WHERE username = ?",
+            "SELECT id, username, password_hash, salt, role, permissions FROM users WHERE username = ?",
             [username],
         )
         return res.rows[0] if res.rows else None
@@ -367,22 +468,34 @@ def get_user_by_username(username: str):
         conn.close()
 
 
-def create_user(username: str, password_raw: str) -> bool:
-    """Create a new user with salted PBKDF2 hash."""
+def create_user(
+    username: str,
+    password_raw: str,
+    role: str = "admin",
+    permissions: list | None = None,
+) -> tuple[bool, str]:
+    """Create a new user with a salted PBKDF2 hash. Returns (success, message)."""
+    username = (username or "").strip()
+    if not username or not password_raw:
+        return False, "Username and password cannot be empty."
+
     salt = secrets.token_hex(16)
     password_hash = hashlib.pbkdf2_hmac(
         "sha256", password_raw.encode(), salt.encode(), 100000
     ).hex()
+    perms_json = json.dumps(normalize_permissions(permissions)) if permissions is not None else None
 
     conn = get_conn()
     try:
         conn.execute(
-            "INSERT INTO users (username, password_hash, salt) VALUES (?, ?, ?)",
-            [username, password_hash, salt],
+            "INSERT INTO users (username, password_hash, salt, role, permissions) VALUES (?, ?, ?, ?, ?)",
+            [username, password_hash, salt, role, perms_json],
         )
-        return True
-    except Exception:
-        return False
+        return True, "Account created."
+    except Exception as e:
+        if _is_unique_violation(e):
+            return False, "That username already exists."
+        return False, f"Could not create account: {e}"
     finally:
         conn.close()
 
@@ -400,13 +513,15 @@ def verify_login(username: str, password_raw: str):
     if not user:
         return False, None, []
 
-    # libsql_client rows can be accessed by index or column name
-    # Scheme: id, username, password_hash, salt
+    # Column order matches the SELECT in get_user_by_username:
+    # id, username, password_hash, salt, role, permissions
     stored_hash = user[2]
     salt = user[3]
+    role = user[4] if len(user) > 4 and user[4] else "admin"
+    perms_raw = user[5] if len(user) > 5 else None
 
     if verify_password(stored_hash, salt, password_raw):
-        return True, "admin", ["all"]
+        return True, role, normalize_permissions(perms_raw)
 
     return False, None, []
 
@@ -1100,8 +1215,11 @@ def module_inventory(conn: sqlite3.Connection) -> None:
                     conn.commit()
                     st.success(f"Saved product '{p_name.strip()}' successfully!")
                     st.rerun()
-                except sqlite3.IntegrityError:
-                    st.error("That barcode is already assigned to another product.")
+                except Exception as e:
+                    if _is_unique_violation(e):
+                        st.error("That barcode is already assigned to another product.")
+                    else:
+                        st.error(f"Could not save product: {e}")
 
     # ---------------- Edit / correct existing item ----------------
     with tab3:
@@ -1151,8 +1269,11 @@ def module_inventory(conn: sqlite3.Connection) -> None:
                         conn.commit()
                         st.success(f"'{e_name.strip()}' updated successfully.")
                         st.rerun()
-                    except sqlite3.IntegrityError:
-                        st.error("That name or barcode is already used by another product.")
+                    except Exception as e:
+                        if _is_unique_violation(e):
+                            st.error("That name or barcode is already used by another product.")
+                        else:
+                            st.error(f"Could not update product: {e}")
 
             st.divider()
             st.subheader("Remove Product")
@@ -1250,8 +1371,11 @@ def module_employee_ledger(conn: sqlite3.Connection) -> None:
                     conn.commit()
                     st.success("Employee registered!")
                     st.rerun()
-                except sqlite3.IntegrityError:
-                    st.error("That employee code already exists.")
+                except Exception as e:
+                    if _is_unique_violation(e):
+                        st.error("That employee code already exists.")
+                    else:
+                        st.error(f"Could not register employee: {e}")
             else:
                 st.error("Employee code and name are required.")
 
