@@ -1,3 +1,4 @@
+
 """
 CMASH Canteen Management System
 --------------------------------
@@ -16,6 +17,7 @@ import hashlib
 import io
 import json
 import secrets
+import re
 import sqlite3
 from datetime import date, datetime, timedelta
 import libsql_client
@@ -37,12 +39,27 @@ EMPLOYEE_LINKED_PAYMENT_TYPES = [
 # =====================================================================
 
 
+_TABLES_WITH_ID_PK = {
+    "users",
+    "products",
+    "employees",
+    "sales",
+    "sale_items",
+    "employee_payments",
+    "returns",
+}
+
+
 class _TursoCursor:
     """Mimics the small slice of sqlite3.Cursor's API this app uses
     (execute / fetchone / fetchall / lastrowid), backed by a libsql_client
     sync Client. libsql_client's ResultSet doesn't have a Python
-    sqlite3-style .lastrowid, so INSERTs are transparently rewritten to add
-    'RETURNING id' and we read the id back from the normal row data."""
+    sqlite3-style .lastrowid, so INSERTs into tables that have an 'id'
+    primary key are transparently rewritten to add 'RETURNING id' and we
+    read the id back from the normal row data. Tables without an 'id'
+    column (e.g. 'settings', keyed by 'key') are left alone - blindly
+    adding RETURNING id there would reference a column that doesn't exist
+    and break the query."""
 
     def __init__(self, client):
         self._client = client
@@ -55,12 +72,17 @@ class _TursoCursor:
         upper = stripped.upper()
 
         is_insert = upper.startswith("INSERT")
+        wants_returning_id = False
         if is_insert and "RETURNING" not in upper:
-            stripped = stripped.rstrip().rstrip(";") + " RETURNING id"
+            m = re.match(r"INSERT\s+INTO\s+(\w+)", stripped, re.IGNORECASE)
+            table_name = m.group(1).lower() if m else None
+            if table_name in _TABLES_WITH_ID_PK:
+                stripped = stripped.rstrip().rstrip(";") + " RETURNING id"
+                wants_returning_id = True
 
         self._result = self._client.execute(stripped, params)
 
-        if is_insert:
+        if wants_returning_id:
             self.lastrowid = self._result.rows[0][0] if self._result.rows else None
 
         return self
@@ -139,6 +161,53 @@ def _is_unique_violation(exc: Exception) -> bool:
     return "unique" in msg and ("constraint" in msg or "violat" in msg)
 
 
+def _extract_select_column_names(sql: str) -> list:
+    """Best-effort fallback for figuring out a SELECT's output column names
+    purely from the query text. Used only when the DB driver doesn't return
+    column metadata for a zero-row result (a libsql_client/HTTP quirk seen
+    with GROUP BY / JOIN queries that match no rows) - without this, a
+    brand-new report or employee with no transactions yet would come back
+    as a DataFrame with NO columns at all, breaking any code that expects
+    a named column (e.g. df["Type"], a .merge(on=...))."""
+    m = re.search(r"SELECT\s+(.*?)\s+FROM\s", sql, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return []
+    col_clause = m.group(1).strip()
+    if col_clause == "*":
+        return []  # can't know real column names without schema introspection
+
+    # Split on top-level commas only (ignore commas inside parentheses).
+    parts, depth, current = [], 0, ""
+    for ch in col_clause:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append(current)
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        parts.append(current)
+
+    names = []
+    for part in parts:
+        part = part.strip()
+        alias_match = (
+            re.search(r"AS\s+'([^']+)'\s*$", part, re.IGNORECASE)
+            or re.search(r'AS\s+"([^"]+)"\s*$', part, re.IGNORECASE)
+            or re.search(r"AS\s+(\w+)\s*$", part, re.IGNORECASE)
+        )
+        if alias_match:
+            names.append(alias_match.group(1))
+        else:
+            # No alias - use the bare column name (last dotted segment).
+            bare = part.split(".")[-1].strip()
+            names.append(bare if bare else part)
+    return names
+
+
 def query_to_dataframe(
     query: str, conn=None, params: list = None
 ) -> pd.DataFrame:
@@ -161,7 +230,12 @@ def query_to_dataframe(
         res = conn.execute(query, params)
         columns = res.columns
         rows = [list(row) for row in res.rows]
-        return pd.DataFrame(rows, columns=columns)
+        if not columns and not rows:
+            # Zero rows with no column metadata - recover expected column
+            # names from the query text so callers still get a properly
+            # shaped (just empty) DataFrame instead of one with no columns.
+            columns = _extract_select_column_names(query)
+        return pd.DataFrame(rows, columns=columns if columns else None)
     except KeyError:
         st.error(
             f"Database Execution Error: Turso rejected query: `{query}`. Verify table and column names exist."
@@ -1428,6 +1502,9 @@ def _get_employee_debit_credit_summary(conn: sqlite3.Connection, start_str: str,
         conn,
         params=(start_str, end_str),
     )
+    if debit_df.empty or "id" not in debit_df.columns:
+        debit_df = pd.DataFrame(columns=["id", "debit_total"])
+
     credit_df = query_to_dataframe(
         """SELECT emp_id AS id, SUM(amount) AS credit_total
            FROM employee_payments
@@ -1436,6 +1513,8 @@ def _get_employee_debit_credit_summary(conn: sqlite3.Connection, start_str: str,
         conn,
         params=(start_str, end_str),
     )
+    if credit_df.empty or "id" not in credit_df.columns:
+        credit_df = pd.DataFrame(columns=["id", "credit_total"])
 
     summary_df = employees_df.merge(debit_df, on="id", how="left").merge(credit_df, on="id", how="left")
     summary_df["debit_total"] = summary_df["debit_total"].fillna(0)
@@ -1445,6 +1524,8 @@ def _get_employee_debit_credit_summary(conn: sqlite3.Connection, start_str: str,
 
 
 def _get_employee_debit_credit_detail(conn: sqlite3.Connection, emp_id: int, start_str: str, end_str: str) -> pd.DataFrame:
+    expected_cols = ["date_sort", "Date", "Type", "Description", "Amount (PKR)"]
+
     debit_rows = query_to_dataframe(
         """SELECT s.sale_date AS date_sort, s.sale_date AS 'Date',
                   'Debit (Purchase)' AS 'Type', p.name AS 'Description',
@@ -1457,6 +1538,9 @@ def _get_employee_debit_credit_detail(conn: sqlite3.Connection, emp_id: int, sta
         conn,
         params=(emp_id, start_str, end_str),
     )
+    if debit_rows.empty or list(debit_rows.columns) != expected_cols:
+        debit_rows = pd.DataFrame(columns=expected_cols)
+
     credit_rows = query_to_dataframe(
         """SELECT payment_date AS date_sort, payment_date AS 'Date',
                   'Credit (Payment)' AS 'Type',
@@ -1467,6 +1551,9 @@ def _get_employee_debit_credit_detail(conn: sqlite3.Connection, emp_id: int, sta
         conn,
         params=(emp_id, start_str, end_str),
     )
+    if credit_rows.empty or list(credit_rows.columns) != expected_cols:
+        credit_rows = pd.DataFrame(columns=expected_cols)
+
     combined = pd.concat([debit_rows, credit_rows], ignore_index=True)
     if not combined.empty:
         combined = combined.sort_values("date_sort", ascending=False).drop(columns=["date_sort"])
