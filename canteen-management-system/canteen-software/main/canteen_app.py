@@ -17,6 +17,7 @@ import hashlib
 import io
 import json
 import secrets
+import time
 import re
 import sqlite3
 from datetime import date, datetime, timedelta
@@ -521,6 +522,11 @@ def hash_password(password: str, salt: str | None = None) -> tuple[str, str]:
     pwd_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 100_000).hex()
     return pwd_hash, salt
 
+MIN_PASSWORD_LENGTH = 8
+MAX_FAILED_LOGINS = 5
+LOCKOUT_SECONDS = 60
+
+
 # =====================================================================
 # AUTH / USER HELPERS
 # =====================================================================
@@ -560,6 +566,8 @@ def create_user(
     username = (username or "").strip()
     if not username or not password_raw:
         return False, "Username and password cannot be empty."
+    if len(password_raw) < MIN_PASSWORD_LENGTH:
+        return False, f"Password should be at least {MIN_PASSWORD_LENGTH} characters."
 
     salt = secrets.token_hex(16)
     password_hash = hashlib.pbkdf2_hmac(
@@ -628,8 +636,8 @@ def login_gate() -> bool:
                 st.error("Username and password cannot be empty.")
             elif new_pass != confirm_pass:
                 st.error("Passwords do not match.")
-            elif len(new_pass) < 4:
-                st.error("Password should be at least 4 characters.")
+            elif len(new_pass) < MIN_PASSWORD_LENGTH:
+                st.error(f"Password should be at least {MIN_PASSWORD_LENGTH} characters.")
             else:
                 ok, msg = create_user(new_user, new_pass)
                 if ok:
@@ -640,6 +648,14 @@ def login_gate() -> bool:
         return False
 
     st.subheader("Login")
+
+    # Simple brute-force protection (per browser session).
+    locked_until = st.session_state.get("login_locked_until", 0)
+    remaining = int(locked_until - time.time())
+    if remaining > 0:
+        st.error(f"Too many failed attempts. Try again in {remaining} seconds.")
+        return False
+
     with st.form("login_form"):
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
@@ -647,25 +663,22 @@ def login_gate() -> bool:
     if submitted:
         ok, role, permissions = verify_login(username, password)
         if ok:
+            st.session_state.pop("failed_logins", None)
+            st.session_state.pop("login_locked_until", None)
             st.session_state["logged_in"] = True
             st.session_state["username"] = username.strip()
             st.session_state["role"] = role
             st.session_state["permissions"] = permissions
             st.rerun()
         else:
-            st.error("Invalid username or password.")
-
-    with st.expander("Add another admin account"):
-        with st.form("add_admin_form"):
-            au = st.text_input("New username", key="add_admin_user")
-            ap = st.text_input("New password", type="password", key="add_admin_pass")
-            add_submit = st.form_submit_button("Create Additional Account")
-        if add_submit:
-            if not au or not ap:
-                st.error("Username and password cannot be empty.")
+            fails = st.session_state.get("failed_logins", 0) + 1
+            st.session_state["failed_logins"] = fails
+            if fails >= MAX_FAILED_LOGINS:
+                st.session_state["failed_logins"] = 0
+                st.session_state["login_locked_until"] = time.time() + LOCKOUT_SECONDS
+                st.error(f"Too many failed attempts. Locked for {LOCKOUT_SECONDS} seconds.")
             else:
-                ok, msg = create_user(au, ap)
-                st.success(msg) if ok else st.error(msg)
+                st.error("Invalid username or password.")
 
     return False
 
@@ -2057,6 +2070,10 @@ def _render_expense_summary_only(
 # =====================================================================
 
 def module_settings() -> None:
+    if st.session_state.get("role") != "admin":
+        st.error("Access denied. Settings are Admin-only.")
+        return
+
     st.header("⚙️ Settings")
 
     st.subheader("Shop Details (shown on printed receipts)")
@@ -2083,6 +2100,22 @@ def module_settings() -> None:
         set_setting("paper_width_mm", paper_width)
         st.success("Settings saved.")
         st.rerun()
+
+    st.divider()
+    st.subheader("🔐 Create Additional Admin")
+    st.caption("Only a logged-in Admin can create another Admin account.")
+    with st.form("add_admin_form", clear_on_submit=True):
+        au = st.text_input("New admin username", key="add_admin_user")
+        ap = st.text_input("New admin password", type="password", key="add_admin_pass")
+        add_submit = st.form_submit_button("Create Admin Account")
+    if add_submit:
+        if st.session_state.get("role") != "admin":
+            st.error("Access denied.")
+        elif not au.strip() or not ap:
+            st.error("Username and password cannot be empty.")
+        else:
+            ok, msg = create_user(au, ap, role="admin")
+            st.success(msg) if ok else st.error(msg)
 
     st.divider()
     st.subheader("👤 Shop Keeper / Shop Person Access")
@@ -2146,8 +2179,8 @@ def module_settings() -> None:
     if sp_submit:
         if not sp_user.strip() or not sp_pass:
             st.error("Username and password cannot be empty.")
-        elif len(sp_pass) < 4:
-            st.error("Password should be at least 4 characters.")
+        elif len(sp_pass) < MIN_PASSWORD_LENGTH:
+            st.error(f"Password should be at least {MIN_PASSWORD_LENGTH} characters.")
         else:
             ok, msg = create_user(
                 sp_user,
