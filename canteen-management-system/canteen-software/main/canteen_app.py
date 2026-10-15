@@ -1900,6 +1900,7 @@ def module_reports(conn: sqlite3.Connection) -> None:
            JOIN sales s ON si.sale_id = s.id
            JOIN products p ON si.product_id = p.id
            WHERE s.sale_date BETWEEN ? AND ?
+             AND COALESCE(s.payment_type, '') <> 'Employee Tab (Monthly Account)'
            GROUP BY p.id
            ORDER BY p.name""",
         conn,
@@ -1907,7 +1908,7 @@ def module_reports(conn: sqlite3.Connection) -> None:
     )
 
     if report_df.empty:
-        st.info("No sales records found for the selected period.")
+        st.info("No sales records found for the selected period (employee-tab purchases are tracked in the Employee Ledger, not here).")
         return
 
     st.dataframe(report_df, use_container_width=True)
@@ -1960,6 +1961,7 @@ def module_full_reports(conn: sqlite3.Connection) -> None:
                JOIN sales s ON si.sale_id = s.id
                JOIN products p ON si.product_id = p.id
                WHERE s.sale_date BETWEEN ? AND ?
+                 AND COALESCE(s.payment_type, '') <> 'Employee Tab (Monthly Account)'
                GROUP BY p.id
                ORDER BY p.name""",
             conn,
