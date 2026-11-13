@@ -687,6 +687,66 @@ def login_gate() -> bool:
 # GENERAL HELPERS
 # =====================================================================
 
+# Columns that should NOT be added up (they are per-unit prices, not amounts).
+_QTY_COLUMNS = {"Quantity", "Units Sold", "Units Sold In Period", "Current Stock Qty", "Total Transactions"}
+
+
+def _is_summable_column(name) -> bool:
+    n = str(name)
+    low = n.lower()
+    if low.startswith("unit ") or low in ("cost price (pkr)", "retail price (pkr)"):
+        return False
+    return "(pkr)" in low or n in _QTY_COLUMNS
+
+
+def _write_totals(ws, df: pd.DataFrame, header_row: int) -> None:
+    """Appends a bold TOTAL row (live Excel SUM formulas) under the data.
+    Sheets that mix purchases and payments in one Amount column (the employee
+    debit/credit log) get separate Debit / Credit / Balance rows instead."""
+    from openpyxl.styles import Font
+    from openpyxl.utils import get_column_letter
+
+    if df.empty:
+        return
+    bold = Font(bold=True)
+    money_fmt = "#,##0.00"
+    cols = list(df.columns)
+    first = header_row + 1
+    last = header_row + len(df)
+    total_row = last + 1
+
+    if "Type" in cols and "Amount (PKR)" in cols:
+        t_col = get_column_letter(cols.index("Type") + 1)
+        a_idx = cols.index("Amount (PKR)") + 1
+        a_col = get_column_letter(a_idx)
+        t_rng = f"${t_col}${first}:${t_col}${last}"
+        a_rng = f"${a_col}${first}:${a_col}${last}"
+        rows = [
+            ("TOTAL DEBIT (Purchases)", f'=SUMIF({t_rng},"Debit (Purchase)",{a_rng})'),
+            ("TOTAL CREDIT (Payments)", f'=SUMIF({t_rng},"Credit (Payment)",{a_rng})'),
+            ("OUTSTANDING BALANCE", f"={a_col}{total_row}-{a_col}{total_row + 1}"),
+        ]
+        for i, (label, formula) in enumerate(rows):
+            r = total_row + i
+            ws.cell(row=r, column=1, value=label).font = bold
+            c = ws.cell(row=r, column=a_idx, value=formula)
+            c.font = bold
+            c.number_format = money_fmt
+        return
+
+    label_done = False
+    for idx, name in enumerate(cols, start=1):
+        if _is_summable_column(name):
+            letter = get_column_letter(idx)
+            c = ws.cell(row=total_row, column=idx, value=f"=SUM({letter}{first}:{letter}{last})")
+            c.font = bold
+            if "(pkr)" in str(name).lower():
+                c.number_format = money_fmt
+        elif not label_done:
+            ws.cell(row=total_row, column=idx, value="TOTAL").font = bold
+            label_done = True
+
+
 def to_excel_bytes(
     sheets: dict[str, pd.DataFrame],
     start_dt: date | None = None,
@@ -694,7 +754,7 @@ def to_excel_bytes(
 ) -> io.BytesIO:
     """Writes each dataframe to its own sheet, with a small header showing the
     exact date/time the report was generated (and the date range, if given)
-    at the top of every sheet."""
+    at the top of every sheet, and a TOTAL row at the bottom."""
     output = io.BytesIO()
     generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -706,6 +766,8 @@ def to_excel_bytes(
             meta_df = pd.DataFrame(meta_rows)
             meta_df.to_excel(writer, index=False, header=False, sheet_name=safe_name, startrow=0)
             df.to_excel(writer, index=False, sheet_name=safe_name, startrow=len(meta_rows) + 1)
+            # Header row sits on Excel row (len(meta_rows) + 2); add totals below the data.
+            _write_totals(writer.sheets[safe_name], df, header_row=len(meta_rows) + 2)
     output.seek(0)
     return output
 
@@ -1405,6 +1467,7 @@ def module_inventory(conn: sqlite3.Connection) -> None:
                JOIN sales s ON si.sale_id = s.id
                JOIN products p ON si.product_id = p.id
                WHERE s.sale_date BETWEEN ? AND ?
+                 AND COALESCE(s.payment_type, '') NOT IN ('Employee Tab (Monthly Account)', 'Hospital Expense', 'OT Expense')
                GROUP BY p.id
                ORDER BY p.name""",
             conn=conn,
@@ -1881,6 +1944,39 @@ def module_ot_expense(conn: sqlite3.Connection) -> None:
 
 
 # =====================================================================
+# SHARED HELPER: BREAKDOWN OF ALL BILLS BY PAYMENT TYPE
+# (so Cash sales, Employee Tab, Hospital and OT can be reconciled separately)
+# =====================================================================
+
+def get_payment_type_breakdown(conn, start_str: str, end_str: str) -> pd.DataFrame:
+    return query_to_dataframe(
+        """SELECT s.payment_type AS 'Payment Type',
+                  COUNT(DISTINCT s.id) AS 'Total Transactions',
+                  SUM(si.qty * si.retail_price) AS 'Total Amount (PKR)'
+           FROM sales s
+           JOIN sale_items si ON s.id = si.sale_id
+           WHERE s.sale_date BETWEEN ? AND ?
+           GROUP BY s.payment_type
+           ORDER BY s.payment_type""",
+        conn,
+        params=(start_str, end_str),
+    )
+
+
+def render_payment_type_breakdown(breakdown_df: pd.DataFrame) -> None:
+    st.write("### Bills by Payment Type (for reconciliation)")
+    st.caption(
+        "Only 'Cash / Direct Payment' is counted in Gross Sales above. Employee Tab, "
+        "Hospital Expense and OT Expense are shown separately here."
+    )
+    if breakdown_df.empty:
+        st.info("No bills in this period.")
+        return
+    st.dataframe(breakdown_df, use_container_width=True)
+    st.metric("All Bills Combined", f"PKR {breakdown_df['Total Amount (PKR)'].sum():,.2f}")
+
+
+# =====================================================================
 # MODULE: PROFIT & SALES REPORTS
 # =====================================================================
 
@@ -1900,15 +1996,18 @@ def module_reports(conn: sqlite3.Connection) -> None:
            JOIN sales s ON si.sale_id = s.id
            JOIN products p ON si.product_id = p.id
            WHERE s.sale_date BETWEEN ? AND ?
-             AND COALESCE(s.payment_type, '') <> 'Employee Tab (Monthly Account)'
+             AND COALESCE(s.payment_type, '') NOT IN ('Employee Tab (Monthly Account)', 'Hospital Expense', 'OT Expense')
            GROUP BY p.id
            ORDER BY p.name""",
         conn,
         params=(start_str, end_str),
     )
 
+    breakdown_df = get_payment_type_breakdown(conn, start_str, end_str)
+
     if report_df.empty:
-        st.info("No sales records found for the selected period (employee-tab purchases are tracked in the Employee Ledger, not here).")
+        st.info("No sales records found for the selected period (employee-tab, hospital and OT purchases are tracked on their own pages, not here).")
+        render_payment_type_breakdown(breakdown_df)
         return
 
     st.dataframe(report_df, use_container_width=True)
@@ -1922,7 +2021,13 @@ def module_reports(conn: sqlite3.Connection) -> None:
     c2.metric("Cost of Goods Sold", f"PKR {tot_cost:,.2f}")
     c3.metric("Net Profit", f"PKR {tot_profit:,.2f}")
 
-    excel_report = to_excel_bytes({"Sales & Profit Report": report_df}, start_dt, end_dt)
+    render_payment_type_breakdown(breakdown_df)
+
+    excel_report = to_excel_bytes(
+        {"Sales & Profit Report": report_df, "Bills by Payment Type": breakdown_df},
+        start_dt,
+        end_dt,
+    )
     st.download_button(
         "📥 Download Report (.xlsx)",
         data=excel_report,
@@ -1961,14 +2066,16 @@ def module_full_reports(conn: sqlite3.Connection) -> None:
                JOIN sales s ON si.sale_id = s.id
                JOIN products p ON si.product_id = p.id
                WHERE s.sale_date BETWEEN ? AND ?
-                 AND COALESCE(s.payment_type, '') <> 'Employee Tab (Monthly Account)'
+                 AND COALESCE(s.payment_type, '') NOT IN ('Employee Tab (Monthly Account)', 'Hospital Expense', 'OT Expense')
                GROUP BY p.id
                ORDER BY p.name""",
             conn,
             params=(start_str, end_str),
         )
+        breakdown_df = get_payment_type_breakdown(conn, start_str, end_str)
         if report_df.empty:
             st.info("No sales records found for this period.")
+            render_payment_type_breakdown(breakdown_df)
         else:
             st.dataframe(report_df, use_container_width=True)
             c1, c2, c3 = st.columns(3)
@@ -1976,7 +2083,13 @@ def module_full_reports(conn: sqlite3.Connection) -> None:
             c2.metric("Cost of Goods Sold", f"PKR {report_df['Total Cost (PKR)'].sum():,.2f}")
             c3.metric("Net Profit", f"PKR {report_df['Profit (PKR)'].sum():,.2f}")
 
-            excel_out = to_excel_bytes({"Sales & Profit Report": report_df}, start_dt, end_dt)
+            render_payment_type_breakdown(breakdown_df)
+
+            excel_out = to_excel_bytes(
+                {"Sales & Profit Report": report_df, "Bills by Payment Type": breakdown_df},
+                start_dt,
+                end_dt,
+            )
             st.download_button(
                 "📥 Download Sales Report (.xlsx)",
                 data=excel_out,
